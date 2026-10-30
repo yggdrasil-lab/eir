@@ -206,6 +206,13 @@ def sync_apple_health_comprehensive(
     _: None = Depends(verify_webhook_token),
 ) -> AppleHealthSyncResponse:
     """Ingests multi-metric health samples with idempotent upsert and multi-day rollups."""
+    extra = getattr(payload, "__pydantic_extra__", {}) or {}
+    logger.info("Apple Health sync received. Extra keys: %s", list(extra.keys()))
+    for k, v in extra.items():
+        val_str = str(v)
+        preview = val_str[:120] + "..." if len(val_str) > 120 else val_str
+        logger.info("  Key [%s] (type %s): %s", k, type(v).__name__, preview)
+
     items = payload.extract_all_samples()
     if not items:
         return AppleHealthSyncResponse(
