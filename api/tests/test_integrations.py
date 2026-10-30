@@ -131,3 +131,58 @@ def test_webhook_token_authentication(client, monkeypatch) -> None:
         json=payload,
     )
     assert valid_query.status_code == 201
+
+
+def test_apple_health_workout_idempotency(client) -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    started_at = (now - dt.timedelta(minutes=60)).isoformat()
+    ended_at = now.isoformat()
+
+    payload = {
+        "workout_type": "Badminton",
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": 3600,
+        "active_energy_kcal": 500,
+        "avg_heart_rate_bpm": 140,
+    }
+
+    # First ingestion
+    first = client.post("/integrations/apple-health/workout", json=payload)
+    assert first.status_code == 201
+    first_id = first.json()["id"]
+
+    # Second ingestion with updated energy
+    payload["active_energy_kcal"] = 550
+    second = client.post("/integrations/apple-health/workout", json=payload)
+    assert second.status_code == 201
+    assert second.json()["id"] == first_id
+    assert second.json()["active_energy_kcal"] == 550
+
+    # Ensure only 1 record exists
+    measurements = client.get("/biometrics?source=apple_health_workout").json()
+    assert len(measurements) == 1
+
+
+def test_apple_health_biometrics_idempotency(client) -> None:
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    payload = {
+        "measured_at": now,
+        "weight_kg": 85.0,
+        "resting_hr_bpm": 55,
+    }
+
+    first = client.post("/integrations/apple-health/biometrics", json=payload)
+    assert first.status_code == 201
+    first_id = first.json()["id"]
+
+    # Re-send sync with added HRV
+    payload["hrv_ms"] = 65.0
+    second = client.post("/integrations/apple-health/biometrics", json=payload)
+    assert second.status_code == 201
+    assert second.json()["id"] == first_id
+    assert second.json()["hrv_ms"] == 65.0
+
+    measurements = client.get("/biometrics?source=apple_health").json()
+    assert len(measurements) == 1
+
