@@ -4,13 +4,14 @@ Receives webhook payloads from Withings Cloud and iOS Shortcuts (HealthKit),
 persisting biometrics and offering optional forward routing to Kratos.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -93,16 +94,33 @@ async def ingest_apple_workout(
         **payload.extra,
     }
 
-    measurement = BiometricMeasurement(
-        id=uuid.uuid4(),
-        measured_at=ended_at,
-        source="apple_health_workout",
-        resting_hr_bpm=payload.avg_heart_rate_bpm,
-        active_energy_kcal=int(payload.active_energy_kcal) if payload.active_energy_kcal else None,
-        notes=payload.notes or f"Workout: {payload.workout_type}",
-        extra=workout_extra,
+    measurement = db.scalar(
+        select(BiometricMeasurement).where(
+            BiometricMeasurement.deleted_at.is_(None),
+            BiometricMeasurement.source == "apple_health_workout",
+            BiometricMeasurement.measured_at >= ended_at - timedelta(seconds=60),
+            BiometricMeasurement.measured_at <= ended_at + timedelta(seconds=60),
+        )
     )
-    db.add(measurement)
+
+    if measurement:
+        # Idempotent update in-place if already recorded
+        measurement.resting_hr_bpm = payload.avg_heart_rate_bpm
+        measurement.active_energy_kcal = int(payload.active_energy_kcal) if payload.active_energy_kcal else None
+        measurement.notes = payload.notes or f"Workout: {payload.workout_type}"
+        measurement.extra = workout_extra
+    else:
+        measurement = BiometricMeasurement(
+            id=uuid.uuid4(),
+            measured_at=ended_at,
+            source="apple_health_workout",
+            resting_hr_bpm=payload.avg_heart_rate_bpm,
+            active_energy_kcal=int(payload.active_energy_kcal) if payload.active_energy_kcal else None,
+            notes=payload.notes or f"Workout: {payload.workout_type}",
+            extra=workout_extra,
+        )
+        db.add(measurement)
+
     db.commit()
     db.refresh(measurement)
 
@@ -146,24 +164,61 @@ def ingest_apple_biometrics(
     _: None = Depends(verify_webhook_token),
 ) -> BiometricMeasurement:
     """Ingests Apple Health vitals: HRV, resting heart rate, sleep duration, and weight."""
-    measurement = BiometricMeasurement(
-        id=uuid.uuid4(),
-        measured_at=payload.measured_at,
-        source="apple_health",
-        weight_kg=payload.weight_kg,
-        body_fat_pct=payload.body_fat_pct,
-        resting_hr_bpm=payload.resting_hr_bpm,
-        hrv_ms=payload.hrv_ms,
-        sleep_duration_s=payload.sleep_duration_s,
-        sleep_deep_s=payload.sleep_deep_s,
-        sleep_rem_s=payload.sleep_rem_s,
-        sleep_score=payload.sleep_score,
-        step_count=payload.step_count,
-        active_energy_kcal=payload.active_energy_kcal,
-        notes=payload.notes,
-        extra=payload.extra,
+    # Idempotent deduplication: match on same source within 60s window
+    measurement = db.scalar(
+        select(BiometricMeasurement).where(
+            BiometricMeasurement.deleted_at.is_(None),
+            BiometricMeasurement.source == "apple_health",
+            BiometricMeasurement.measured_at >= payload.measured_at - timedelta(seconds=60),
+            BiometricMeasurement.measured_at <= payload.measured_at + timedelta(seconds=60),
+        )
     )
-    db.add(measurement)
+
+    if measurement:
+        if payload.weight_kg is not None:
+            measurement.weight_kg = payload.weight_kg
+        if payload.body_fat_pct is not None:
+            measurement.body_fat_pct = payload.body_fat_pct
+        if payload.resting_hr_bpm is not None:
+            measurement.resting_hr_bpm = payload.resting_hr_bpm
+        if payload.hrv_ms is not None:
+            measurement.hrv_ms = payload.hrv_ms
+        if payload.sleep_duration_s is not None:
+            measurement.sleep_duration_s = payload.sleep_duration_s
+        if payload.sleep_deep_s is not None:
+            measurement.sleep_deep_s = payload.sleep_deep_s
+        if payload.sleep_rem_s is not None:
+            measurement.sleep_rem_s = payload.sleep_rem_s
+        if payload.sleep_score is not None:
+            measurement.sleep_score = payload.sleep_score
+        if payload.step_count is not None:
+            measurement.step_count = payload.step_count
+        if payload.active_energy_kcal is not None:
+            measurement.active_energy_kcal = payload.active_energy_kcal
+        if payload.notes:
+            measurement.notes = payload.notes
+        if payload.extra:
+            measurement.extra = {**measurement.extra, **payload.extra}
+    else:
+        measurement = BiometricMeasurement(
+            id=uuid.uuid4(),
+            measured_at=payload.measured_at,
+            source="apple_health",
+            weight_kg=payload.weight_kg,
+            body_fat_pct=payload.body_fat_pct,
+            resting_hr_bpm=payload.resting_hr_bpm,
+            hrv_ms=payload.hrv_ms,
+            sleep_duration_s=payload.sleep_duration_s,
+            sleep_deep_s=payload.sleep_deep_s,
+            sleep_rem_s=payload.sleep_rem_s,
+            sleep_score=payload.sleep_score,
+            step_count=payload.step_count,
+            active_energy_kcal=payload.active_energy_kcal,
+            notes=payload.notes,
+            extra=payload.extra,
+        )
+        db.add(measurement)
+
     db.commit()
     db.refresh(measurement)
     return measurement
@@ -223,20 +278,48 @@ def ingest_withings_measurement(
     _: None = Depends(verify_webhook_token),
 ) -> BiometricMeasurement:
     """Ingests weight, body fat %, muscle mass, and water % from Withings scale."""
-    measurement = BiometricMeasurement(
-        id=uuid.uuid4(),
-        measured_at=payload.measured_at,
-        source="withings",
-        weight_kg=payload.weight_kg,
-        body_fat_pct=payload.body_fat_pct,
-        muscle_mass_kg=payload.muscle_mass_kg,
-        water_pct=payload.water_pct,
-        bone_mass_kg=payload.bone_mass_kg,
-        resting_hr_bpm=payload.resting_hr_bpm,
-        notes=payload.notes,
-        extra=payload.extra,
+    # Idempotent deduplication for Withings scale measurements
+    measurement = db.scalar(
+        select(BiometricMeasurement).where(
+            BiometricMeasurement.deleted_at.is_(None),
+            BiometricMeasurement.source == "withings",
+            BiometricMeasurement.measured_at >= payload.measured_at - timedelta(seconds=60),
+            BiometricMeasurement.measured_at <= payload.measured_at + timedelta(seconds=60),
+        )
     )
-    db.add(measurement)
+
+    if measurement:
+        measurement.weight_kg = payload.weight_kg
+        if payload.body_fat_pct is not None:
+            measurement.body_fat_pct = payload.body_fat_pct
+        if payload.muscle_mass_kg is not None:
+            measurement.muscle_mass_kg = payload.muscle_mass_kg
+        if payload.water_pct is not None:
+            measurement.water_pct = payload.water_pct
+        if payload.bone_mass_kg is not None:
+            measurement.bone_mass_kg = payload.bone_mass_kg
+        if payload.resting_hr_bpm is not None:
+            measurement.resting_hr_bpm = payload.resting_hr_bpm
+        if payload.notes:
+            measurement.notes = payload.notes
+        if payload.extra:
+            measurement.extra = {**measurement.extra, **payload.extra}
+    else:
+        measurement = BiometricMeasurement(
+            id=uuid.uuid4(),
+            measured_at=payload.measured_at,
+            source="withings",
+            weight_kg=payload.weight_kg,
+            body_fat_pct=payload.body_fat_pct,
+            muscle_mass_kg=payload.muscle_mass_kg,
+            water_pct=payload.water_pct,
+            bone_mass_kg=payload.bone_mass_kg,
+            resting_hr_bpm=payload.resting_hr_bpm,
+            notes=payload.notes,
+            extra=payload.extra,
+        )
+        db.add(measurement)
+
     db.commit()
     db.refresh(measurement)
     return measurement
