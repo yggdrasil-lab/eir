@@ -184,6 +184,48 @@ def build_mcp_server() -> MCPServer:
             return json.dumps(summary)
 
     @server.tool(
+        name="eir_get_granular_samples",
+        description="Fetch high-resolution time-series samples (e.g. heart rate readings, sleep intervals) for a specific date (YYYY-MM-DD) and sample type.",
+    )
+    def get_granular_samples(target_date: str, sample_type: str, limit: int = 1000) -> str:
+        try:
+            d = date.fromisoformat(target_date)
+        except ValueError as err:
+            raise ToolError(f"Invalid date format: {target_date}. Expected YYYY-MM-DD.") from err
+
+        start_dt = datetime.combine(d, time.min).replace(tzinfo=timezone.utc)
+        end_dt = datetime.combine(d, time.max).replace(tzinfo=timezone.utc)
+
+        with mcp_session() as db:
+            stmt = (
+                select(HealthSample)
+                .where(
+                    HealthSample.deleted_at.is_(None),
+                    HealthSample.sample_type == sample_type,
+                    HealthSample.measured_at >= start_dt,
+                    HealthSample.measured_at <= end_dt,
+                )
+                .order_by(HealthSample.measured_at.asc())
+                .limit(limit)
+            )
+            samples = list(db.scalars(stmt))
+            results = [
+                {
+                    "measured_at": s.measured_at.isoformat(),
+                    "ended_at": s.ended_at.isoformat(),
+                    "value": float(s.value),
+                    "unit": s.unit,
+                }
+                for s in samples
+            ]
+            return json.dumps({
+                "date": target_date,
+                "sample_type": sample_type,
+                "count": len(results),
+                "samples": results,
+            })
+
+    @server.tool(
         name="eir_log_measurement",
         description="Log a biometric measurement (weight, body fat %, resting HR, HRV, sleep, steps) from an agent.",
     )

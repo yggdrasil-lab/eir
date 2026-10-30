@@ -4,7 +4,7 @@ Receives webhook payloads from Withings Cloud and iOS Shortcuts (HealthKit),
 persisting biometrics and offering optional forward routing to Kratos.
 """
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import logging
 import uuid
@@ -19,6 +19,8 @@ from app.db import get_db
 from app.models import BiometricMeasurement, HealthSample
 from app.schemas import (
     AppleBiometricsPayload,
+    AppleHealthComprehensiveSyncPayload,
+    AppleHealthSyncResponse,
     AppleWorkoutPayload,
     BiometricRead,
     HealthSampleBulkPayload,
@@ -342,6 +344,211 @@ def ingest_apple_health_samples(
         ingested=ingested_count,
         sample_type=payload.sample_type,
         daily_total=daily_total,
+    )
+
+
+def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
+    """Calculates and persists daily rollup metrics from health_sample into biometric_measurement."""
+    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=timezone.utc)
+    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=timezone.utc)
+
+    # 1. Latest weight
+    w = db.scalar(
+        select(HealthSample.value)
+        .where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["weight", "weight_kg"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+        .order_by(HealthSample.measured_at.desc())
+        .limit(1)
+    )
+
+    # 2. Latest body fat
+    bf = db.scalar(
+        select(HealthSample.value)
+        .where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["body_fat_pct", "body_fat", "body_fat_percentage"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+        .order_by(HealthSample.measured_at.desc())
+        .limit(1)
+    )
+
+    # 3. Resting HR
+    rhr = db.scalar(
+        select(HealthSample.value)
+        .where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["resting_hr", "resting_heart_rate", "resting_hr_bpm"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+        .order_by(HealthSample.measured_at.desc())
+        .limit(1)
+    )
+
+    # 4. HRV
+    hrv = db.scalar(
+        select(HealthSample.value)
+        .where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["hrv", "heart_rate_variability", "hrv_ms", "hrv_sdnn"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+        .order_by(HealthSample.measured_at.desc())
+        .limit(1)
+    )
+
+    # 5. Sleep duration (sum of seconds)
+    sleep_s = db.scalar(
+        select(func.sum(HealthSample.value)).where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["sleep", "sleep_duration", "sleep_duration_s", "sleep_analysis"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+    )
+
+    # 6. Active energy
+    energy_kcal = db.scalar(
+        select(func.sum(HealthSample.value)).where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["active_energy", "active_energy_kcal"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+    )
+
+    # 7. Step count
+    steps = db.scalar(
+        select(func.sum(HealthSample.value)).where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["step_count", "steps"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+    )
+
+    # Find or create daily biometric_measurement
+    measurement = db.scalar(
+        select(BiometricMeasurement).where(
+            BiometricMeasurement.deleted_at.is_(None),
+            BiometricMeasurement.source == "apple_health",
+            BiometricMeasurement.measured_at >= start_dt,
+            BiometricMeasurement.measured_at <= end_dt,
+        ).order_by(BiometricMeasurement.measured_at.desc()).limit(1)
+    )
+
+    if not measurement:
+        measurement = BiometricMeasurement(
+            id=uuid.uuid4(),
+            measured_at=datetime.combine(target_date, time(8, 0)).replace(tzinfo=timezone.utc),
+            source="apple_health",
+            notes=f"Apple Health rollup for {target_date.isoformat()}",
+        )
+        db.add(measurement)
+
+    if w is not None:
+        measurement.weight_kg = w
+    if bf is not None:
+        measurement.body_fat_pct = bf
+    if rhr is not None:
+        measurement.resting_hr_bpm = int(round(rhr))
+    if hrv is not None:
+        measurement.hrv_ms = hrv
+    if sleep_s is not None:
+        measurement.sleep_duration_s = int(round(sleep_s))
+    if energy_kcal is not None:
+        measurement.active_energy_kcal = int(round(energy_kcal))
+    if steps is not None:
+        measurement.step_count = int(round(steps))
+
+    return measurement
+
+
+@router.post(
+    "/apple-health/sync",
+    response_model=AppleHealthSyncResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Comprehensive high-resolution Apple Health multi-metric synchronization (2-day rollups)",
+)
+def sync_apple_health_comprehensive(
+    payload: AppleHealthComprehensiveSyncPayload,
+    db: Session = Depends(get_db),
+    _: None = Depends(verify_webhook_token),
+) -> AppleHealthSyncResponse:
+    """Ingests multi-metric health samples with idempotent upsert and multi-day rollups."""
+    items = payload.extract_all_samples()
+    if not items:
+        return AppleHealthSyncResponse(
+            status="empty",
+            total_samples_ingested=0,
+            metrics_summary={},
+            days_processed=[],
+        )
+
+    min_date = min(it.measured_at for it in items)
+    max_date = max((it.ended_at or it.measured_at) for it in items)
+
+    # Batch query existing samples in range for fast in-memory upsert
+    existing_stmt = select(HealthSample).where(
+        HealthSample.deleted_at.is_(None),
+        HealthSample.source == payload.source,
+        HealthSample.measured_at >= min_date,
+        HealthSample.measured_at <= max_date,
+    )
+    existing_map = {
+        (s.source, s.sample_type, _normalize_key_dt(s.measured_at), _normalize_key_dt(s.ended_at)): s
+        for s in db.scalars(existing_stmt)
+    }
+
+    metrics_counts: dict[str, int] = {}
+    for item in items:
+        st = item.sample_type or "unknown"
+        metrics_counts[st] = metrics_counts.get(st, 0) + 1
+        ended_at = item.ended_at or item.measured_at
+        key = (item.source or payload.source, st, _normalize_key_dt(item.measured_at), _normalize_key_dt(ended_at))
+
+        if key in existing_map:
+            existing_sample = existing_map[key]
+            existing_sample.value = item.value
+            existing_sample.unit = item.unit
+            if item.extra:
+                existing_sample.extra = item.extra
+        else:
+            sample = HealthSample(
+                id=uuid.uuid4(),
+                source=item.source or payload.source,
+                sample_type=st,
+                measured_at=item.measured_at,
+                ended_at=ended_at,
+                value=item.value,
+                unit=item.unit,
+                external_id=item.external_id,
+                extra=item.extra,
+            )
+            db.add(sample)
+            existing_map[key] = sample
+
+    db.commit()
+
+    # Recalculate and update daily rollups for each distinct calendar day
+    days = sorted(set(it.measured_at.date() for it in items))
+    for d in days:
+        _sync_daily_rollups(db, d)
+
+    db.commit()
+
+    return AppleHealthSyncResponse(
+        status="ok",
+        total_samples_ingested=len(items),
+        metrics_summary=metrics_counts,
+        days_processed=days,
     )
 
 
