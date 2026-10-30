@@ -150,3 +150,35 @@ def test_apple_health_comprehensive_sync_two_days(client) -> None:
     assert float(today_summary["latest_weight_kg"]) == 87.5
     assert today_summary["resting_hr_bpm"] == 50
     assert today_summary["active_energy_kcal"] == 300
+
+
+def test_apple_health_sync_multiline_strings_support(client) -> None:
+    today = dt.date.today()
+    t1 = dt.datetime.combine(today, dt.time(10, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t2 = dt.datetime.combine(today, dt.time(10, 5)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    # iOS Shortcuts can serialize lists as newline-separated strings in dictionary values
+    payload = {
+        "active_energy_dates": f"{t1}\n{t2}",
+        "active_energy_values": "5.5 kcal\n4.5 kcal",
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+    assert res.json()["total_samples_ingested"] == 2
+    assert res.json()["metrics_summary"]["active_energy"] == 2
+
+
+def test_apple_health_sync_root_level_metric_support(client) -> None:
+    today = dt.date.today()
+    t1 = dt.datetime.combine(today, dt.time(11, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t2 = dt.datetime.combine(today, dt.time(11, 15)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    payload = {
+        "sample_type": "active_energy",
+        "dates": [t1, t2],
+        "values": [12.0, 18.0],
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+    assert res.json()["total_samples_ingested"] == 2
+    assert res.json()["metrics_summary"]["active_energy"] == 2
