@@ -98,14 +98,28 @@ async def ingest_apple_workout(
         **payload.extra,
     }
 
-    measurement = db.scalar(
-        select(BiometricMeasurement).where(
+    # Idempotent deduplication:
+    # If explicit ended_at was given, match by exact ±60s window.
+    # If ended_at was omitted (periodic sync of today's exercise), match any workout for today.
+    if payload.ended_at:
+        match_stmt = select(BiometricMeasurement).where(
             BiometricMeasurement.deleted_at.is_(None),
             BiometricMeasurement.source == "apple_health_workout",
             BiometricMeasurement.measured_at >= ended_at - timedelta(seconds=60),
             BiometricMeasurement.measured_at <= ended_at + timedelta(seconds=60),
         )
-    )
+    else:
+        # Match within the same calendar day (UTC/local boundary)
+        start_of_day = ended_at.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = start_of_day + timedelta(days=1)
+        match_stmt = select(BiometricMeasurement).where(
+            BiometricMeasurement.deleted_at.is_(None),
+            BiometricMeasurement.source == "apple_health_workout",
+            BiometricMeasurement.measured_at >= start_of_day,
+            BiometricMeasurement.measured_at < end_of_day,
+        )
+
+    measurement = db.scalar(match_stmt.order_by(BiometricMeasurement.measured_at.desc()).limit(1))
 
     if measurement:
         # Idempotent update in-place if already recorded
