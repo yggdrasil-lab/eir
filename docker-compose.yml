@@ -27,7 +27,7 @@ services:
         parallelism: 1
         order: stop-first
       restart_policy:
-        condition: on-failure
+        condition: any
       resources:
         limits:
           memory: 512M
@@ -55,7 +55,7 @@ services:
         constraints:
           - node.role == manager
       restart_policy:
-        condition: on-failure
+        condition: any
       resources:
         limits:
           memory: 512M
