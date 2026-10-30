@@ -112,8 +112,8 @@ def build_mcp_server() -> MCPServer:
         except ValueError as err:
             raise ToolError(f"Invalid date format: {target_date}. Expected YYYY-MM-DD.") from err
 
-        start_dt = datetime.combine(d, time.min).replace(tzinfo=timezone.utc)
-        end_dt = datetime.combine(d, time.max).replace(tzinfo=timezone.utc)
+        start_dt = datetime.combine(d, time.min).replace(tzinfo=settings.tz)
+        end_dt = datetime.combine(d, time.max).replace(tzinfo=settings.tz)
 
         with mcp_session() as db:
             stmt = (
@@ -193,8 +193,8 @@ def build_mcp_server() -> MCPServer:
         except ValueError as err:
             raise ToolError(f"Invalid date format: {target_date}. Expected YYYY-MM-DD.") from err
 
-        start_dt = datetime.combine(d, time.min).replace(tzinfo=timezone.utc)
-        end_dt = datetime.combine(d, time.max).replace(tzinfo=timezone.utc)
+        start_dt = datetime.combine(d, time.min).replace(tzinfo=settings.tz)
+        end_dt = datetime.combine(d, time.max).replace(tzinfo=settings.tz)
 
         with mcp_session() as db:
             stmt = (

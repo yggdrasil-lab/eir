@@ -72,8 +72,8 @@ def _normalize_key_dt(dt_: datetime | None) -> str:
 
 def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
     """Calculates and persists daily rollup metrics from health_sample into biometric_measurement."""
-    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=timezone.utc)
-    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=timezone.utc)
+    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
+    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
 
     # 1. Latest weight
     w = db.scalar(
@@ -170,7 +170,7 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
     if not measurement:
         measurement = BiometricMeasurement(
             id=uuid.uuid4(),
-            measured_at=datetime.combine(target_date, time(8, 0)).replace(tzinfo=timezone.utc),
+            measured_at=datetime.combine(target_date, time(8, 0)).replace(tzinfo=settings.tz),
             source="apple_health",
             notes=f"Apple Health rollup for {target_date.isoformat()}",
         )
