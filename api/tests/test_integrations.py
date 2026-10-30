@@ -82,8 +82,8 @@ def test_withings_measurements_ingestion(client) -> None:
     assert response.status_code == 201
     data = response.json()
     assert data["source"] == "withings"
-    assert data["weight_kg"] == 87.2
-    assert data["body_fat_pct"] == 17.8
+    assert float(data["weight_kg"]) == 87.2
+    assert float(data["body_fat_pct"]) == 17.8
 
 
 def test_webhook_token_authentication(client, monkeypatch) -> None:
@@ -181,8 +181,74 @@ def test_apple_health_biometrics_idempotency(client) -> None:
     second = client.post("/integrations/apple-health/biometrics", json=payload)
     assert second.status_code == 201
     assert second.json()["id"] == first_id
-    assert second.json()["hrv_ms"] == 65.0
+    assert float(second.json()["hrv_ms"]) == 65.0
 
     measurements = client.get("/biometrics?source=apple_health").json()
     assert len(measurements) == 1
+
+
+def test_apple_health_granular_samples_parallel_arrays(client) -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    t1 = now.isoformat()
+    t2 = (now + dt.timedelta(minutes=5)).isoformat()
+    t3 = (now + dt.timedelta(minutes=10)).isoformat()
+
+    payload = {
+        "sample_type": "active_energy",
+        "unit": "kcal",
+        "start_dates": [t1, t2, t3],
+        "end_dates": [t2, t3, (now + dt.timedelta(minutes=15)).isoformat()],
+        "values": ["2.5 kcal", 3.0, "5.0 kcal"],
+    }
+
+    res = client.post("/integrations/apple-health/samples", json=payload)
+    assert res.status_code == 201
+    data = res.json()
+    assert data["status"] == "ok"
+    assert data["ingested"] == 3
+    assert float(data["daily_total"]) == 10.5
+
+    # Idempotent re-ingest: sending again should not duplicate
+    res_repeat = client.post("/integrations/apple-health/samples", json=payload)
+    assert res_repeat.status_code == 201
+    assert float(res_repeat.json()["daily_total"]) == 10.5
+
+    # Check daily summary reflects granular sum
+    today_str = now.date().isoformat()
+    daily_res = client.get(f"/biometrics/daily/{today_str}")
+    assert daily_res.status_code == 200
+    assert daily_res.json()["active_energy_kcal"] == 10
+
+
+def test_apple_health_granular_samples_object_array(client) -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    t1 = now.isoformat()
+    t2 = (now + dt.timedelta(minutes=10)).isoformat()
+
+    payload = {
+        "sample_type": "step_count",
+        "unit": "count",
+        "samples": [
+            {"measured_at": t1, "value": 150},
+            {"measured_at": t2, "value": 250},
+        ],
+    }
+
+    res = client.post("/integrations/apple-health/samples", json=payload)
+    assert res.status_code == 201
+    assert res.json()["ingested"] == 2
+    assert float(res.json()["daily_total"]) == 400.0
+
+
+def test_multiline_string_numeric_parsing(client) -> None:
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    payload = {
+        "workout_type": "Walk",
+        "started_at": now,
+        "ended_at": now,
+        "active_energy_kcal": "2 kcal\n1.5 kcal\n3.0 kcal",
+    }
+    res = client.post("/integrations/apple-health/workout", json=payload)
+    assert res.status_code == 201
+    assert res.json()["active_energy_kcal"] == 6
 

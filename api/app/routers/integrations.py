@@ -4,23 +4,25 @@ Receives webhook payloads from Withings Cloud and iOS Shortcuts (HealthKit),
 persisting biometrics and offering optional forward routing to Kratos.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
-from app.models import BiometricMeasurement
+from app.models import BiometricMeasurement, HealthSample
 from app.schemas import (
     AppleBiometricsPayload,
     AppleWorkoutPayload,
     BiometricRead,
+    HealthSampleBulkPayload,
+    HealthSampleBulkResponse,
     WithingsMeasurementPayload,
 )
 
@@ -240,6 +242,107 @@ def ingest_apple_biometrics(
     db.commit()
     db.refresh(measurement)
     return measurement
+
+
+def _normalize_key_dt(dt_: datetime | None) -> str:
+    if dt_ is None:
+        return ""
+    if dt_.tzinfo is not None:
+        return dt_.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return dt_.strftime("%Y-%m-%d %H:%M:%S")
+
+
+@router.post(
+    "/apple-health/samples",
+    response_model=HealthSampleBulkResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Ingest granular health samples (active energy, steps) from Apple Watch",
+)
+@router.post(
+    "/apple-health/bulk-samples",
+    response_model=HealthSampleBulkResponse,
+    status_code=status.HTTP_201_CREATED,
+    include_in_schema=False,
+)
+def ingest_apple_health_samples(
+    payload: HealthSampleBulkPayload,
+    db: Session = Depends(get_db),
+    _: None = Depends(verify_webhook_token),
+) -> HealthSampleBulkResponse:
+    """Bulk ingest granular time-series samples with idempotent upsert."""
+    items = payload.to_sample_items()
+    if not items:
+        return HealthSampleBulkResponse(
+            status="empty",
+            ingested=0,
+            sample_type=payload.sample_type,
+            daily_total=None,
+        )
+
+    min_date = min(it.measured_at for it in items)
+    max_date = max((it.ended_at or it.measured_at) for it in items)
+
+    # Batch query existing samples in range for fast in-memory upsert
+    existing_stmt = select(HealthSample).where(
+        HealthSample.deleted_at.is_(None),
+        HealthSample.source == payload.source,
+        HealthSample.sample_type == payload.sample_type,
+        HealthSample.measured_at >= min_date,
+        HealthSample.measured_at <= max_date,
+    )
+    existing_map = {
+        (_normalize_key_dt(s.measured_at), _normalize_key_dt(s.ended_at)): s
+        for s in db.scalars(existing_stmt)
+    }
+
+    ingested_count = 0
+    for item in items:
+        ended_at = item.ended_at or item.measured_at
+        key = (_normalize_key_dt(item.measured_at), _normalize_key_dt(ended_at))
+        if key in existing_map:
+            existing_sample = existing_map[key]
+            existing_sample.value = item.value
+            existing_sample.unit = item.unit
+            if item.extra:
+                existing_sample.extra = item.extra
+        else:
+            sample = HealthSample(
+                id=uuid.uuid4(),
+                source=item.source or payload.source,
+                sample_type=item.sample_type or payload.sample_type,
+                measured_at=item.measured_at,
+                ended_at=ended_at,
+                value=item.value,
+                unit=item.unit or payload.unit,
+                external_id=item.external_id,
+                extra=item.extra,
+            )
+            db.add(sample)
+            existing_map[key] = sample
+        ingested_count += 1
+
+    db.commit()
+
+    # Calculate daily sum for the target date
+    ref_date = items[0].measured_at.date()
+    start_of_day = datetime.combine(ref_date, time.min).replace(tzinfo=timezone.utc)
+    end_of_day = start_of_day + timedelta(days=1)
+
+    sum_stmt = select(func.sum(HealthSample.value)).where(
+        HealthSample.deleted_at.is_(None),
+        HealthSample.source == payload.source,
+        HealthSample.sample_type == payload.sample_type,
+        HealthSample.measured_at >= start_of_day,
+        HealthSample.measured_at < end_of_day,
+    )
+    daily_total = db.scalar(sum_stmt)
+
+    return HealthSampleBulkResponse(
+        status="ok",
+        ingested=ingested_count,
+        sample_type=payload.sample_type,
+        daily_total=daily_total,
+    )
 
 
 # --------------------------------------------------------------------- Withings
