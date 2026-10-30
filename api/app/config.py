@@ -1,5 +1,7 @@
 """Application configuration loaded from environment variables."""
 
+import zoneinfo
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +18,11 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     mcp_token: str | None = None
     webhook_secret: str | None = None
+    timezone: str = "Pacific/Auckland"
+
+    @property
+    def tz(self) -> zoneinfo.ZoneInfo:
+        return zoneinfo.ZoneInfo(self.timezone)
 
     @property
     def cors_origin_list(self) -> list[str]:

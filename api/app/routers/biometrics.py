@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db import get_db
 from app.models import BiometricMeasurement, HealthSample
 from app.schemas import BiometricCreate, BiometricRead, DailyBiometricSummary, HealthSampleRead
@@ -23,8 +24,8 @@ def get_granular_samples(
     db: Session = Depends(get_db),
 ) -> list[HealthSample]:
     """Retrieves high-resolution time-series samples for a specific date and metric."""
-    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=timezone.utc)
-    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=timezone.utc)
+    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
+    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
 
     stmt = (
         select(HealthSample)
@@ -59,8 +60,8 @@ def get_daily_summary(
     db: Session = Depends(get_db),
 ) -> DailyBiometricSummary:
     """Aggregates all biometric readings for a single calendar day."""
-    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=timezone.utc)
-    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=timezone.utc)
+    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
+    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
 
     stmt = (
         select(BiometricMeasurement)

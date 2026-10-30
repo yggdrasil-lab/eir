@@ -137,6 +137,32 @@ class DailyBiometricSummary(BaseModel):
 
 
 # ------------------------------------------------------------- Granular Samples
+def _clean_datetime(v: Any) -> Any:
+    """Parses ISO strings, timestamps, and iOS human-formatted date strings."""
+    if v is None or isinstance(v, datetime):
+        return v
+    if isinstance(v, str):
+        cleaned = v.replace("\u202f", " ").replace(" at ", " ").strip()
+        try:
+            return datetime.fromisoformat(cleaned)
+        except ValueError:
+            pass
+        for fmt in (
+            "%d %b %Y %I:%M %p",
+            "%d %b %Y %I:%M:%S %p",
+            "%d %B %Y %I:%M %p",
+            "%b %d, %Y %I:%M %p",
+            "%Y-%m-%d %H:%M:%S",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y %I:%M %p",
+        ):
+            try:
+                return datetime.strptime(cleaned, fmt)
+            except ValueError:
+                pass
+    return v
+
+
 class HealthSampleItem(BaseModel):
     """A single granular time-series sample (e.g. active energy slice)."""
 
@@ -148,6 +174,11 @@ class HealthSampleItem(BaseModel):
     source: str | None = None
     external_id: str | None = None
     extra: dict = Field(default_factory=dict)
+
+    @field_validator("measured_at", "ended_at", mode="before")
+    @classmethod
+    def parse_datetimes(cls, v: Any) -> Any:
+        return _clean_datetime(v)
 
     @field_validator("value", mode="before")
     @classmethod
@@ -260,7 +291,12 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
                         )
 
         # 2. Process flat parallel array patterns from extra fields: e.g. "heart_rate_dates" & "heart_rate_values"
-        extra_fields = getattr(self, "__pydantic_extra__", {}) or {}
+        extra_fields = dict(getattr(self, "__pydantic_extra__", {}) or {})
+        # Unwrap nested dictionaries (e.g. keyless {"": {...}} or {"payload": {...}} from iOS Shortcuts)
+        for ek, ev in list(extra_fields.items()):
+            if isinstance(ev, dict) and any(subk.endswith("_dates") or subk in ("dates", "start_dates") for subk in ev.keys()):
+                extra_fields.update(ev)
+
         prefixes: set[str] = set()
         for k in extra_fields.keys():
             if k.endswith("_dates"):

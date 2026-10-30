@@ -168,6 +168,24 @@ def test_apple_health_sync_multiline_strings_support(client) -> None:
     assert res.json()["metrics_summary"]["active_energy"] == 2
 
 
+def test_apple_health_sync_keyless_nested_dictionary_support(client) -> None:
+    today = dt.date.today()
+    t1 = dt.datetime.combine(today, dt.time(12, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t2 = dt.datetime.combine(today, dt.time(12, 10)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    # iOS Shortcuts keyless dictionary wrapper: {"": {"active_energy_dates": ..., ...}}
+    payload = {
+        "": {
+            "active_energy_dates": f"{t1}\n{t2}",
+            "active_energy_values": "8.0 kcal\n9.5 kcal",
+        }
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+    assert res.json()["total_samples_ingested"] == 2
+    assert res.json()["metrics_summary"]["active_energy"] == 2
+
+
 def test_apple_health_sync_root_level_metric_support(client) -> None:
     today = dt.date.today()
     t1 = dt.datetime.combine(today, dt.time(11, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
@@ -177,6 +195,17 @@ def test_apple_health_sync_root_level_metric_support(client) -> None:
         "sample_type": "active_energy",
         "dates": [t1, t2],
         "values": [12.0, 18.0],
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+    assert res.json()["total_samples_ingested"] == 2
+    assert res.json()["metrics_summary"]["active_energy"] == 2
+
+
+def test_apple_health_sync_human_locale_date_format(client) -> None:
+    payload = {
+        "active_energy_dates": "29 Oct 2026 at 6:35\u202fPM\n29 Oct 2026 at 6:40\u202fPM",
+        "active_energy_values": "15.0\n20.0",
     }
     res = client.post("/integrations/apple-health/sync", json=payload)
     assert res.status_code == 201

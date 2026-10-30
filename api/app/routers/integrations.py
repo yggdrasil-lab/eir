@@ -72,8 +72,8 @@ def _normalize_key_dt(dt_: datetime | None) -> str:
 
 def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
     """Calculates and persists daily rollup metrics from health_sample into biometric_measurement."""
-    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=timezone.utc)
-    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=timezone.utc)
+    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
+    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
 
     # 1. Latest weight
     w = db.scalar(
@@ -170,7 +170,7 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
     if not measurement:
         measurement = BiometricMeasurement(
             id=uuid.uuid4(),
-            measured_at=datetime.combine(target_date, time(8, 0)).replace(tzinfo=timezone.utc),
+            measured_at=datetime.combine(target_date, time(8, 0)).replace(tzinfo=settings.tz),
             source="apple_health",
             notes=f"Apple Health rollup for {target_date.isoformat()}",
         )
@@ -206,6 +206,13 @@ def sync_apple_health_comprehensive(
     _: None = Depends(verify_webhook_token),
 ) -> AppleHealthSyncResponse:
     """Ingests multi-metric health samples with idempotent upsert and multi-day rollups."""
+    extra = getattr(payload, "__pydantic_extra__", {}) or {}
+    logger.info("Apple Health sync received. Extra keys: %s", list(extra.keys()))
+    for k, v in extra.items():
+        val_str = str(v)
+        preview = val_str[:120] + "..." if len(val_str) > 120 else val_str
+        logger.info("  Key [%s] (type %s): %s", k, type(v).__name__, preview)
+
     items = payload.extract_all_samples()
     if not items:
         return AppleHealthSyncResponse(
