@@ -52,54 +52,6 @@ class HealthRead(BaseModel):
 
 
 # ------------------------------------------------------------- Integrations
-class AppleWorkoutPayload(BaseModel):
-    """Workout telemetry pushed from Apple Watch via iOS Shortcuts."""
-
-    workout_type: str = "Workout"
-    started_at: datetime | None = None
-    ended_at: datetime | None = None
-    duration_seconds: int | None = None
-    duration_minutes: Decimal | None = None
-    active_energy_kcal: Decimal | None = None
-    avg_heart_rate_bpm: int | None = None
-    max_heart_rate_bpm: int | None = None
-    distance_meters: Decimal | None = None
-    pool_length_meters: Decimal | None = None
-    strokes: int | None = None
-    notes: str | None = None
-    forward_to_kratos: bool = False
-    extra: dict = Field(default_factory=dict)
-
-    @field_validator("duration_minutes", "active_energy_kcal", "distance_meters", mode="before")
-    @classmethod
-    def parse_decimals(cls, v: Any) -> Decimal | None:
-        return _clean_numeric(v)
-
-    @field_validator("duration_seconds", "avg_heart_rate_bpm", "max_heart_rate_bpm", mode="before")
-    @classmethod
-    def parse_ints(cls, v: Any) -> int | None:
-        val = _clean_numeric(v)
-        return int(round(val)) if val is not None else None
-
-
-class AppleBiometricsPayload(BaseModel):
-    """Daily or morning biometrics from Apple Health via iOS Shortcuts."""
-
-    measured_at: datetime = Field(default_factory=datetime.now)
-    weight_kg: Decimal | None = None
-    body_fat_pct: Decimal | None = None
-    resting_hr_bpm: int | None = None
-    hrv_ms: Decimal | None = None
-    sleep_duration_s: int | None = None
-    sleep_deep_s: int | None = None
-    sleep_rem_s: int | None = None
-    sleep_score: int | None = None
-    step_count: int | None = None
-    active_energy_kcal: int | None = None
-    notes: str | None = None
-    extra: dict = Field(default_factory=dict)
-
-
 class WithingsMeasurementPayload(BaseModel):
     """Direct body scale measurement from Withings Body Smart scale."""
 
@@ -206,51 +158,6 @@ class HealthSampleItem(BaseModel):
         return parsed
 
 
-class HealthSampleBulkPayload(BaseModel):
-    """Bulk ingestion payload accepting either object arrays or parallel arrays from iOS Shortcuts."""
-
-    source: str = "apple_health"
-    sample_type: str = "active_energy"
-    unit: str | None = "kcal"
-    samples: list[HealthSampleItem] = Field(default_factory=list)
-    start_dates: list[datetime] = Field(default_factory=list)
-    end_dates: list[datetime] = Field(default_factory=list)
-    values: list[Any] = Field(default_factory=list)
-
-    def to_sample_items(self) -> list[HealthSampleItem]:
-        """Unifies input format (samples array or parallel arrays) into items."""
-        items: list[HealthSampleItem] = []
-        for s in self.samples:
-            items.append(
-                HealthSampleItem(
-                    measured_at=s.measured_at,
-                    ended_at=s.ended_at or s.measured_at,
-                    value=s.value,
-                    sample_type=s.sample_type or self.sample_type,
-                    unit=s.unit or self.unit,
-                    source=s.source or self.source,
-                    external_id=s.external_id,
-                    extra=s.extra,
-                )
-            )
-        if self.start_dates and self.values:
-            for i, (st, val) in enumerate(zip(self.start_dates, self.values)):
-                end = self.end_dates[i] if i < len(self.end_dates) else st
-                cleaned_val = _clean_numeric(val)
-                if cleaned_val is not None:
-                    items.append(
-                        HealthSampleItem(
-                            measured_at=st,
-                            ended_at=end,
-                            value=cleaned_val,
-                            sample_type=self.sample_type,
-                            unit=self.unit,
-                            source=self.source,
-                        )
-                    )
-        return items
-
-
 class HealthSampleRead(ORMModel):
     id: uuid.UUID
     source: str
@@ -260,13 +167,6 @@ class HealthSampleRead(ORMModel):
     value: Decimal
     unit: str | None = None
     created_at: datetime
-
-
-class HealthSampleBulkResponse(BaseModel):
-    status: str = "ok"
-    ingested: int
-    sample_type: str
-    daily_total: Decimal | None = None
 
 
 # ------------------------------------------------------------- Comprehensive Sync
