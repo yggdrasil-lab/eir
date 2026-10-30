@@ -75,10 +75,14 @@ async def ingest_apple_workout(
     _: None = Depends(verify_webhook_token),
 ) -> BiometricMeasurement:
     """Records Apple Watch workout telemetry and optionally forwards to Kratos."""
-    started_at = payload.started_at
-    ended_at = payload.ended_at
+    now = datetime.now(timezone.utc)
+    ended_at = payload.ended_at or now
+    started_at = payload.started_at or (ended_at - timedelta(minutes=float(payload.duration_minutes or 30)))
+
     duration_s = payload.duration_seconds
-    if duration_s is None and started_at and ended_at:
+    if duration_s is None and payload.duration_minutes is not None:
+        duration_s = int(payload.duration_minutes * 60)
+    elif duration_s is None and started_at and ended_at:
         duration_s = max(0, int((ended_at - started_at).total_seconds()))
 
     workout_extra = {
