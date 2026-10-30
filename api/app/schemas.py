@@ -1,10 +1,34 @@
 """Pydantic schemas for Eir API request and response validation."""
 
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+import re
+from typing import Any
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def _clean_numeric(v: Any) -> Decimal | None:
+    """Robustly parse numeric values from iOS Shortcuts (handles units and arrays)."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float, Decimal)):
+        return Decimal(str(v))
+    if isinstance(v, (list, tuple)):
+        # Sum list of numbers if iOS passes multiple samples
+        cleaned = [_clean_numeric(x) for x in v]
+        nums = [x for x in cleaned if x is not None]
+        return sum(nums, Decimal(0)) if nums else None
+    if isinstance(v, str):
+        # Extract digits and decimals, ignoring suffixes like 'kcal', 'min', 'bpm'
+        m = re.search(r"[-+]?\d*\.?\d+", v.replace(",", ""))
+        if m:
+            try:
+                return Decimal(m.group(0))
+            except InvalidOperation:
+                return None
+    return None
 
 
 class ORMModel(BaseModel):
@@ -35,6 +59,17 @@ class AppleWorkoutPayload(BaseModel):
     notes: str | None = None
     forward_to_kratos: bool = False
     extra: dict = Field(default_factory=dict)
+
+    @field_validator("duration_minutes", "active_energy_kcal", "distance_meters", mode="before")
+    @classmethod
+    def parse_decimals(cls, v: Any) -> Decimal | None:
+        return _clean_numeric(v)
+
+    @field_validator("duration_seconds", "avg_heart_rate_bpm", "max_heart_rate_bpm", mode="before")
+    @classmethod
+    def parse_ints(cls, v: Any) -> int | None:
+        val = _clean_numeric(v)
+        return int(round(val)) if val is not None else None
 
 
 class AppleBiometricsPayload(BaseModel):
