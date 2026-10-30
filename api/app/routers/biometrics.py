@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import BiometricMeasurement
+from app.models import BiometricMeasurement, HealthSample
 from app.schemas import BiometricCreate, BiometricRead, DailyBiometricSummary
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
@@ -72,6 +72,29 @@ def get_daily_summary(
             summary.active_energy_kcal = (summary.active_energy_kcal or 0) + r.active_energy_kcal
         if r.notes:
             readiness_notes.append(r.notes)
+
+    # Granular samples take precedence if recorded for this day
+    granular_active_energy = db.scalar(
+        select(func.sum(HealthSample.value)).where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type == "active_energy",
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+    )
+    if granular_active_energy is not None:
+        summary.active_energy_kcal = int(round(granular_active_energy))
+
+    granular_steps = db.scalar(
+        select(func.sum(HealthSample.value)).where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type == "step_count",
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+    )
+    if granular_steps is not None:
+        summary.step_count = int(round(granular_steps))
 
     summary.readiness_notes = readiness_notes
     return summary

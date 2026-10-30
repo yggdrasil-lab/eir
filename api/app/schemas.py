@@ -10,11 +10,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def _clean_numeric(v: Any) -> Decimal | None:
-    """Robustly parse numeric values from iOS Shortcuts (handles units and arrays)."""
+    """Robustly parse numeric values from iOS Shortcuts (handles units, arrays, and multiline)."""
     if v is None:
         return None
     if isinstance(v, (int, float, Decimal)):
         return Decimal(str(v))
+    if isinstance(v, dict):
+        for k in ("value", "qty", "amount", "total"):
+            if k in v:
+                return _clean_numeric(v[k])
+        return None
     if isinstance(v, (list, tuple)):
         # Sum list of numbers if iOS passes multiple samples
         cleaned = [_clean_numeric(x) for x in v]
@@ -22,12 +27,17 @@ def _clean_numeric(v: Any) -> Decimal | None:
         return sum(nums, Decimal(0)) if nums else None
     if isinstance(v, str):
         # Extract digits and decimals, ignoring suffixes like 'kcal', 'min', 'bpm'
-        m = re.search(r"[-+]?\d*\.?\d+", v.replace(",", ""))
-        if m:
+        # If string contains multiple numbers/lines, sum all matches
+        matches = re.findall(r"[-+]?\d*\.?\d+", v.replace(",", ""))
+        if not matches:
+            return None
+        nums = []
+        for m in matches:
             try:
-                return Decimal(m.group(0))
+                nums.append(Decimal(m))
             except InvalidOperation:
-                return None
+                pass
+        return sum(nums, Decimal(0)) if nums else None
     return None
 
 
@@ -172,3 +182,88 @@ class DailyBiometricSummary(BaseModel):
     step_count: int | None = None
     active_energy_kcal: int | None = None
     readiness_notes: list[str] = Field(default_factory=list)
+
+
+# ------------------------------------------------------------- Granular Samples
+class HealthSampleItem(BaseModel):
+    """A single granular time-series sample (e.g. active energy slice)."""
+
+    measured_at: datetime
+    ended_at: datetime | None = None
+    value: Decimal
+    sample_type: str | None = None
+    unit: str | None = None
+    source: str | None = None
+    external_id: str | None = None
+    extra: dict = Field(default_factory=dict)
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def parse_value(cls, v: Any) -> Decimal:
+        parsed = _clean_numeric(v)
+        if parsed is None:
+            raise ValueError(f"Cannot parse numeric value from {v}")
+        return parsed
+
+
+class HealthSampleBulkPayload(BaseModel):
+    """Bulk ingestion payload accepting either object arrays or parallel arrays from iOS Shortcuts."""
+
+    source: str = "apple_health"
+    sample_type: str = "active_energy"
+    unit: str | None = "kcal"
+    samples: list[HealthSampleItem] = Field(default_factory=list)
+    start_dates: list[datetime] = Field(default_factory=list)
+    end_dates: list[datetime] = Field(default_factory=list)
+    values: list[Any] = Field(default_factory=list)
+
+    def to_sample_items(self) -> list[HealthSampleItem]:
+        """Unifies input format (samples array or parallel arrays) into items."""
+        items: list[HealthSampleItem] = []
+        for s in self.samples:
+            items.append(
+                HealthSampleItem(
+                    measured_at=s.measured_at,
+                    ended_at=s.ended_at or s.measured_at,
+                    value=s.value,
+                    sample_type=s.sample_type or self.sample_type,
+                    unit=s.unit or self.unit,
+                    source=s.source or self.source,
+                    external_id=s.external_id,
+                    extra=s.extra,
+                )
+            )
+        if self.start_dates and self.values:
+            for i, (st, val) in enumerate(zip(self.start_dates, self.values)):
+                end = self.end_dates[i] if i < len(self.end_dates) else st
+                cleaned_val = _clean_numeric(val)
+                if cleaned_val is not None:
+                    items.append(
+                        HealthSampleItem(
+                            measured_at=st,
+                            ended_at=end,
+                            value=cleaned_val,
+                            sample_type=self.sample_type,
+                            unit=self.unit,
+                            source=self.source,
+                        )
+                    )
+        return items
+
+
+class HealthSampleRead(ORMModel):
+    id: uuid.UUID
+    source: str
+    sample_type: str
+    measured_at: datetime
+    ended_at: datetime
+    value: Decimal
+    unit: str | None = None
+    created_at: datetime
+
+
+class HealthSampleBulkResponse(BaseModel):
+    status: str = "ok"
+    ingested: int
+    sample_type: str
+    daily_total: Decimal | None = None

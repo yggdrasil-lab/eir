@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -25,7 +25,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.config import settings
-from app.models import BiometricMeasurement
+from app.models import BiometricMeasurement, HealthSample
 from app.schemas import BiometricCreate
 
 SOURCE = "agent"
@@ -157,6 +157,29 @@ def build_mcp_server() -> MCPServer:
                     summary["step_count"] += r.step_count
                 if r.active_energy_kcal is not None:
                     summary["active_energy_kcal"] += r.active_energy_kcal
+
+            # Check granular health samples
+            granular_active_energy = db.scalar(
+                select(func.sum(HealthSample.value)).where(
+                    HealthSample.deleted_at.is_(None),
+                    HealthSample.sample_type == "active_energy",
+                    HealthSample.measured_at >= start_dt,
+                    HealthSample.measured_at <= end_dt,
+                )
+            )
+            if granular_active_energy is not None:
+                summary["active_energy_kcal"] = int(round(granular_active_energy))
+
+            granular_steps = db.scalar(
+                select(func.sum(HealthSample.value)).where(
+                    HealthSample.deleted_at.is_(None),
+                    HealthSample.sample_type == "step_count",
+                    HealthSample.measured_at >= start_dt,
+                    HealthSample.measured_at <= end_dt,
+                )
+            )
+            if granular_steps is not None:
+                summary["step_count"] = int(round(granular_steps))
 
             return json.dumps(summary)
 

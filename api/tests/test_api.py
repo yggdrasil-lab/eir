@@ -31,7 +31,7 @@ def test_create_and_get_biometric_entry(client) -> None:
     )
     assert response.status_code == 201
     created = response.json()
-    assert created["weight_kg"] == 85.5
+    assert float(created["weight_kg"]) == 85.5
     assert created["source"] == "manual"
     assert created["resting_hr_bpm"] == 55
     measurement_id = created["id"]
@@ -78,7 +78,7 @@ def test_daily_summary(client) -> None:
     assert summary_res.status_code == 200
     summary = summary_res.json()
     assert summary["date"] == today.isoformat()
-    assert summary["latest_weight_kg"] == 86.0
+    assert float(summary["latest_weight_kg"]) == 86.0
     assert summary["resting_hr_bpm"] == 54
     assert summary["sleep_duration_hours"] == 8.0
     assert summary["sleep_deep_hours"] == 1.5

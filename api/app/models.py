@@ -63,3 +63,32 @@ class BiometricMeasurement(TimestampMixin, Base):
         Index("biometric_measured_at_idx", measured_at.desc(), postgresql_where=text("deleted_at is null")),
         Index("biometric_source_idx", source, postgresql_where=text("deleted_at is null")),
     )
+
+
+class HealthSample(TimestampMixin, Base):
+    """Granular time-series samples from Apple Health or wearables (e.g. active energy, steps)."""
+
+    __tablename__ = "health_sample"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    source: Mapped[str] = mapped_column(Text, nullable=False)  # 'apple_health'
+    sample_type: Mapped[str] = mapped_column(Text, nullable=False)  # 'active_energy', 'step_count', 'heart_rate'
+    measured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    value: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    unit: Mapped[str | None] = mapped_column(Text, nullable=True)
+    external_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("health_sample_measured_at_idx", measured_at.desc(), postgresql_where=text("deleted_at is null")),
+        Index("health_sample_type_idx", sample_type, measured_at.desc(), postgresql_where=text("deleted_at is null")),
+        Index(
+            "health_sample_dedup_idx",
+            source,
+            sample_type,
+            measured_at,
+            ended_at,
+            unique=True,
+            postgresql_where=text("deleted_at is null"),
+        ),
+    )
