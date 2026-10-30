@@ -1,0 +1,51 @@
+name: Deploy Eir
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, gaia]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.tienzo.net
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_RAW_PASSWORD }}
+
+      - name: Setup Secrets
+        env:
+          EIR_MCP_TOKEN: ${{ secrets.EIR_MCP_TOKEN }}
+        run: |
+          if [ -z "${EIR_MCP_TOKEN}" ]; then
+            echo "Error: EIR_MCP_TOKEN secret is required" >&2
+            exit 1
+          fi
+          curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/ensure_secret.sh -o /tmp/ensure_secret.sh
+          chmod +x /tmp/ensure_secret.sh
+          echo "EIR_MCP_TOKEN_NAME=$(echo "$EIR_MCP_TOKEN" | /tmp/ensure_secret.sh eir_mcp_token)" >> $GITHUB_ENV
+
+      - name: Prepare host data directory
+        env:
+          EIR_DB_MOUNT_PATH: ${{ vars.EIR_DB_MOUNT_PATH }}
+        run: |
+          DB_DIR="${EIR_DB_MOUNT_PATH:-/opt/eir/data}"
+          docker run --rm -v "${DB_DIR}":/data alpine mkdir -p /data
+
+      - name: Build and Deploy with Docker Compose
+        env:
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+          EIR_DB_MOUNT_PATH: ${{ vars.EIR_DB_MOUNT_PATH || '/opt/eir/data' }}
+          IMAGE_TAG: eir
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh
+          chmod +x /tmp/deploy.sh
+          /tmp/deploy.sh "eir" docker-compose.yml
