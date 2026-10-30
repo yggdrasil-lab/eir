@@ -16,7 +16,6 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     mcp_token: str | None = None
     webhook_secret: str | None = None
-    kratos_api_url: str = "http://kratos-api:8000"
 
     @property
     def cors_origin_list(self) -> list[str]:

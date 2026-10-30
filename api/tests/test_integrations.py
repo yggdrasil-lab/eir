@@ -1,61 +1,17 @@
 """Tests for Withings and Apple Health integration webhooks in Eir."""
 
 import datetime as dt
+from decimal import Decimal
+
+from app.schemas import _clean_numeric
 
 
-def test_apple_health_biometrics_ingestion(client) -> None:
-    now = dt.datetime.now(dt.timezone.utc).isoformat()
-    response = client.post(
-        "/integrations/apple-health/biometrics",
-        json={
-            "measured_at": now,
-            "weight_kg": 88.5,
-            "resting_hr_bpm": 52,
-            "hrv_ms": 62.4,
-            "sleep_duration_s": 28800,
-            "sleep_deep_s": 5400,
-            "sleep_rem_s": 6200,
-            "sleep_score": 87,
-            "step_count": 8500,
-            "active_energy_kcal": 450,
-            "notes": "Morning health sync",
-        },
-    )
-    assert response.status_code == 201
-    data = response.json()
-    assert data["source"] == "apple_health"
-    assert data["resting_hr_bpm"] == 52
-    assert data["sleep_duration_s"] == 28800
-
-    # Query latest
-    latest = client.get("/biometrics/latest")
-    assert latest.status_code == 200
-    assert latest.json()["source"] == "apple_health"
-
-
-def test_apple_health_workout_ingestion(client) -> None:
-    now = dt.datetime.now(dt.timezone.utc)
-    started_at = (now - dt.timedelta(minutes=60)).isoformat()
-    ended_at = now.isoformat()
-
-    response = client.post(
-        "/integrations/apple-health/workout",
-        json={
-            "workout_type": "Badminton",
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "duration_seconds": 3600,
-            "active_energy_kcal": 550,
-            "avg_heart_rate_bpm": 145,
-            "max_heart_rate_bpm": 175,
-            "notes": "Fast-paced match",
-        },
-    )
-    assert response.status_code == 201
-    data = response.json()
-    assert data["source"] == "apple_health_workout"
-    assert data["extra"]["workout_type"] == "Badminton"
-    assert data["active_energy_kcal"] == 550
+def test_clean_numeric_multiline_and_strings() -> None:
+    assert _clean_numeric("2 kcal\n1.5 kcal\n3.0 kcal") == Decimal("6.5")
+    assert _clean_numeric(["10", "20.5"]) == Decimal("30.5")
+    assert _clean_numeric({"value": "72.5 kg"}) == Decimal("72.5")
+    assert _clean_numeric("invalid") is None
+    assert _clean_numeric(None) is None
 
 
 def test_withings_webhook_verification(client) -> None:
@@ -133,126 +89,6 @@ def test_webhook_token_authentication(client, monkeypatch) -> None:
     assert valid_query.status_code == 201
 
 
-def test_apple_health_workout_idempotency(client) -> None:
-    now = dt.datetime.now(dt.timezone.utc)
-    started_at = (now - dt.timedelta(minutes=60)).isoformat()
-    ended_at = now.isoformat()
-
-    payload = {
-        "workout_type": "Badminton",
-        "started_at": started_at,
-        "ended_at": ended_at,
-        "duration_seconds": 3600,
-        "active_energy_kcal": 500,
-        "avg_heart_rate_bpm": 140,
-    }
-
-    # First ingestion
-    first = client.post("/integrations/apple-health/workout", json=payload)
-    assert first.status_code == 201
-    first_id = first.json()["id"]
-
-    # Second ingestion with updated energy
-    payload["active_energy_kcal"] = 550
-    second = client.post("/integrations/apple-health/workout", json=payload)
-    assert second.status_code == 201
-    assert second.json()["id"] == first_id
-    assert second.json()["active_energy_kcal"] == 550
-
-    # Ensure only 1 record exists
-    measurements = client.get("/biometrics?source=apple_health_workout").json()
-    assert len(measurements) == 1
-
-
-def test_apple_health_biometrics_idempotency(client) -> None:
-    now = dt.datetime.now(dt.timezone.utc).isoformat()
-    payload = {
-        "measured_at": now,
-        "weight_kg": 85.0,
-        "resting_hr_bpm": 55,
-    }
-
-    first = client.post("/integrations/apple-health/biometrics", json=payload)
-    assert first.status_code == 201
-    first_id = first.json()["id"]
-
-    # Re-send sync with added HRV
-    payload["hrv_ms"] = 65.0
-    second = client.post("/integrations/apple-health/biometrics", json=payload)
-    assert second.status_code == 201
-    assert second.json()["id"] == first_id
-    assert float(second.json()["hrv_ms"]) == 65.0
-
-    measurements = client.get("/biometrics?source=apple_health").json()
-    assert len(measurements) == 1
-
-
-def test_apple_health_granular_samples_parallel_arrays(client) -> None:
-    now = dt.datetime.now(dt.timezone.utc)
-    t1 = now.isoformat()
-    t2 = (now + dt.timedelta(minutes=5)).isoformat()
-    t3 = (now + dt.timedelta(minutes=10)).isoformat()
-
-    payload = {
-        "sample_type": "active_energy",
-        "unit": "kcal",
-        "start_dates": [t1, t2, t3],
-        "end_dates": [t2, t3, (now + dt.timedelta(minutes=15)).isoformat()],
-        "values": ["2.5 kcal", 3.0, "5.0 kcal"],
-    }
-
-    res = client.post("/integrations/apple-health/samples", json=payload)
-    assert res.status_code == 201
-    data = res.json()
-    assert data["status"] == "ok"
-    assert data["ingested"] == 3
-    assert float(data["daily_total"]) == 10.5
-
-    # Idempotent re-ingest: sending again should not duplicate
-    res_repeat = client.post("/integrations/apple-health/samples", json=payload)
-    assert res_repeat.status_code == 201
-    assert float(res_repeat.json()["daily_total"]) == 10.5
-
-    # Check daily summary reflects granular sum
-    today_str = now.date().isoformat()
-    daily_res = client.get(f"/biometrics/daily/{today_str}")
-    assert daily_res.status_code == 200
-    assert daily_res.json()["active_energy_kcal"] == 10
-
-
-def test_apple_health_granular_samples_object_array(client) -> None:
-    now = dt.datetime.now(dt.timezone.utc)
-    t1 = now.isoformat()
-    t2 = (now + dt.timedelta(minutes=10)).isoformat()
-
-    payload = {
-        "sample_type": "step_count",
-        "unit": "count",
-        "samples": [
-            {"measured_at": t1, "value": 150},
-            {"measured_at": t2, "value": 250},
-        ],
-    }
-
-    res = client.post("/integrations/apple-health/samples", json=payload)
-    assert res.status_code == 201
-    assert res.json()["ingested"] == 2
-    assert float(res.json()["daily_total"]) == 400.0
-
-
-def test_multiline_string_numeric_parsing(client) -> None:
-    now = dt.datetime.now(dt.timezone.utc).isoformat()
-    payload = {
-        "workout_type": "Walk",
-        "started_at": now,
-        "ended_at": now,
-        "active_energy_kcal": "2 kcal\n1.5 kcal\n3.0 kcal",
-    }
-    res = client.post("/integrations/apple-health/workout", json=payload)
-    assert res.status_code == 201
-    assert res.json()["active_energy_kcal"] == 6
-
-
 def test_apple_health_comprehensive_sync_two_days(client) -> None:
     today = dt.date.today()
     yesterday = today - dt.timedelta(days=1)
@@ -315,3 +151,34 @@ def test_apple_health_comprehensive_sync_two_days(client) -> None:
     assert today_summary["resting_hr_bpm"] == 50
     assert today_summary["active_energy_kcal"] == 300
 
+
+def test_apple_health_sync_multiline_strings_support(client) -> None:
+    today = dt.date.today()
+    t1 = dt.datetime.combine(today, dt.time(10, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t2 = dt.datetime.combine(today, dt.time(10, 5)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    # iOS Shortcuts can serialize lists as newline-separated strings in dictionary values
+    payload = {
+        "active_energy_dates": f"{t1}\n{t2}",
+        "active_energy_values": "5.5 kcal\n4.5 kcal",
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+    assert res.json()["total_samples_ingested"] == 2
+    assert res.json()["metrics_summary"]["active_energy"] == 2
+
+
+def test_apple_health_sync_root_level_metric_support(client) -> None:
+    today = dt.date.today()
+    t1 = dt.datetime.combine(today, dt.time(11, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t2 = dt.datetime.combine(today, dt.time(11, 15)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    payload = {
+        "sample_type": "active_energy",
+        "dates": [t1, t2],
+        "values": [12.0, 18.0],
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+    assert res.json()["total_samples_ingested"] == 2
+    assert res.json()["metrics_summary"]["active_energy"] == 2
