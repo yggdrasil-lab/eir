@@ -200,3 +200,14 @@ def test_apple_health_sync_root_level_metric_support(client) -> None:
     assert res.status_code == 201
     assert res.json()["total_samples_ingested"] == 2
     assert res.json()["metrics_summary"]["active_energy"] == 2
+
+
+def test_apple_health_sync_human_locale_date_format(client) -> None:
+    payload = {
+        "active_energy_dates": "29 Oct 2026 at 6:35\u202fPM\n29 Oct 2026 at 6:40\u202fPM",
+        "active_energy_values": "15.0\n20.0",
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+    assert res.json()["total_samples_ingested"] == 2
+    assert res.json()["metrics_summary"]["active_energy"] == 2

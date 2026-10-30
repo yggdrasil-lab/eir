@@ -137,6 +137,32 @@ class DailyBiometricSummary(BaseModel):
 
 
 # ------------------------------------------------------------- Granular Samples
+def _clean_datetime(v: Any) -> Any:
+    """Parses ISO strings, timestamps, and iOS human-formatted date strings."""
+    if v is None or isinstance(v, datetime):
+        return v
+    if isinstance(v, str):
+        cleaned = v.replace("\u202f", " ").replace(" at ", " ").strip()
+        try:
+            return datetime.fromisoformat(cleaned)
+        except ValueError:
+            pass
+        for fmt in (
+            "%d %b %Y %I:%M %p",
+            "%d %b %Y %I:%M:%S %p",
+            "%d %B %Y %I:%M %p",
+            "%b %d, %Y %I:%M %p",
+            "%Y-%m-%d %H:%M:%S",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y %I:%M %p",
+        ):
+            try:
+                return datetime.strptime(cleaned, fmt)
+            except ValueError:
+                pass
+    return v
+
+
 class HealthSampleItem(BaseModel):
     """A single granular time-series sample (e.g. active energy slice)."""
 
@@ -148,6 +174,11 @@ class HealthSampleItem(BaseModel):
     source: str | None = None
     external_id: str | None = None
     extra: dict = Field(default_factory=dict)
+
+    @field_validator("measured_at", "ended_at", mode="before")
+    @classmethod
+    def parse_datetimes(cls, v: Any) -> Any:
+        return _clean_datetime(v)
 
     @field_validator("value", mode="before")
     @classmethod
