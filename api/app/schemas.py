@@ -267,3 +267,129 @@ class HealthSampleBulkResponse(BaseModel):
     ingested: int
     sample_type: str
     daily_total: Decimal | None = None
+
+
+# ------------------------------------------------------------- Comprehensive Sync
+DEFAULT_METRIC_UNITS: dict[str, str] = {
+    "active_energy": "kcal",
+    "basal_energy": "kcal",
+    "heart_rate": "bpm",
+    "resting_hr": "bpm",
+    "hrv": "ms",
+    "sleep": "s",
+    "sleep_duration": "s",
+    "step_count": "count",
+    "weight": "kg",
+    "body_fat": "%",
+    "body_fat_pct": "%",
+    "distance": "m",
+    "flights": "count",
+    "vo2_max": "ml/kg/min",
+    "oxygen_saturation": "%",
+    "body_temperature": "C",
+    "wrist_temperature": "C",
+}
+
+METRIC_ALIASES: dict[str, str] = {
+    "weight_kg": "weight",
+    "body_fat_percentage": "body_fat_pct",
+    "body_fat": "body_fat_pct",
+    "resting_heart_rate": "resting_hr",
+    "resting_hr_bpm": "resting_hr",
+    "heart_rate_variability": "hrv",
+    "hrv_sdnn": "hrv",
+    "hrv_ms": "hrv",
+    "sleep_analysis": "sleep",
+    "sleep_duration_s": "sleep",
+    "sleep_duration": "sleep",
+    "steps": "step_count",
+    "step": "step_count",
+    "active_energy_kcal": "active_energy",
+    "energy": "active_energy",
+    "distance_meters": "distance",
+}
+
+
+class AppleHealthComprehensiveSyncPayload(BaseModel):
+    """Universal payload for high-resolution multi-metric Apple Health synchronization."""
+
+    model_config = ConfigDict(extra="allow")
+
+    source: str = "apple_health"
+    samples: list[HealthSampleItem] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+    def extract_all_samples(self) -> list[HealthSampleItem]:
+        """Extracts and normalizes samples from explicit items, metric groups, or flat parallel arrays."""
+        items: list[HealthSampleItem] = list(self.samples)
+
+        # 1. Process explicit metrics dictionary: {"heart_rate": {"start_dates": [...], "values": [...]}}
+        for raw_metric_name, data in self.metrics.items():
+            canonical_type = METRIC_ALIASES.get(raw_metric_name, raw_metric_name)
+            default_unit = DEFAULT_METRIC_UNITS.get(canonical_type)
+            if isinstance(data, dict):
+                s_dates = data.get("start_dates") or data.get("dates") or []
+                e_dates = data.get("end_dates") or []
+                vals = data.get("values") or data.get("durations") or []
+                unit = data.get("unit") or default_unit
+                for i, (st, val) in enumerate(zip(s_dates, vals)):
+                    end = e_dates[i] if i < len(e_dates) else st
+                    cleaned_val = _clean_numeric(val)
+                    if cleaned_val is not None:
+                        items.append(
+                            HealthSampleItem(
+                                measured_at=st,
+                                ended_at=end,
+                                value=cleaned_val,
+                                sample_type=canonical_type,
+                                unit=unit,
+                                source=self.source,
+                            )
+                        )
+
+        # 2. Process flat parallel array patterns from extra fields: e.g. "heart_rate_dates" & "heart_rate_values"
+        extra_fields = getattr(self, "__pydantic_extra__", {}) or {}
+        prefixes: set[str] = set()
+        for k in extra_fields.keys():
+            if k.endswith("_dates"):
+                prefix = k[:-6]
+                if prefix.endswith("_start"):
+                    prefix = prefix[:-6]
+                prefixes.add(prefix)
+
+        for prefix in prefixes:
+            s_dates = extra_fields.get(f"{prefix}_start_dates") or extra_fields.get(f"{prefix}_dates") or []
+            e_dates = extra_fields.get(f"{prefix}_end_dates") or []
+            vals = (
+                extra_fields.get(f"{prefix}_values")
+                or extra_fields.get(f"{prefix}_durations")
+                or extra_fields.get(prefix)
+                or []
+            )
+            canonical_type = METRIC_ALIASES.get(prefix, prefix)
+            default_unit = DEFAULT_METRIC_UNITS.get(canonical_type)
+            unit = extra_fields.get(f"{prefix}_unit") or default_unit
+
+            if isinstance(s_dates, list) and isinstance(vals, list) and s_dates and vals:
+                for i, (st, val) in enumerate(zip(s_dates, vals)):
+                    end = e_dates[i] if (isinstance(e_dates, list) and i < len(e_dates)) else st
+                    cleaned_val = _clean_numeric(val)
+                    if cleaned_val is not None:
+                        items.append(
+                            HealthSampleItem(
+                                measured_at=st,
+                                ended_at=end,
+                                value=cleaned_val,
+                                sample_type=canonical_type,
+                                unit=unit,
+                                source=self.source,
+                            )
+                        )
+        return items
+
+
+class AppleHealthSyncResponse(BaseModel):
+    status: str = "ok"
+    total_samples_ingested: int
+    metrics_summary: dict[str, int] = Field(default_factory=dict)
+    days_processed: list[date] = Field(default_factory=list)

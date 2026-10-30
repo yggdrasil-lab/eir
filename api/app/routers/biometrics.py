@@ -10,9 +10,34 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import BiometricMeasurement, HealthSample
-from app.schemas import BiometricCreate, BiometricRead, DailyBiometricSummary
+from app.schemas import BiometricCreate, BiometricRead, DailyBiometricSummary, HealthSampleRead
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
+
+
+@router.get("/granular", response_model=list[HealthSampleRead])
+def get_granular_samples(
+    target_date: date = Query(description="Calendar date (YYYY-MM-DD)"),
+    sample_type: str = Query(description="Sample type, e.g. 'heart_rate', 'sleep', 'active_energy'"),
+    limit: int = Query(default=2000, ge=1, le=5000),
+    db: Session = Depends(get_db),
+) -> list[HealthSample]:
+    """Retrieves high-resolution time-series samples for a specific date and metric."""
+    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=timezone.utc)
+    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=timezone.utc)
+
+    stmt = (
+        select(HealthSample)
+        .where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type == sample_type,
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+        .order_by(HealthSample.measured_at.asc())
+        .limit(limit)
+    )
+    return list(db.scalars(stmt))
 
 
 @router.get("/latest", response_model=BiometricRead | None)
