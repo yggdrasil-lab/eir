@@ -21,10 +21,11 @@ class HealthRead(BaseModel):
 class AppleWorkoutPayload(BaseModel):
     """Workout telemetry pushed from Apple Watch via iOS Shortcuts."""
 
-    workout_type: str
-    started_at: datetime
-    ended_at: datetime
+    workout_type: str = "Workout"
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
     duration_seconds: int | None = None
+    duration_minutes: Decimal | None = None
     active_energy_kcal: Decimal | None = None
     avg_heart_rate_bpm: int | None = None
     max_heart_rate_bpm: int | None = None
