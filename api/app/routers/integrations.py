@@ -162,15 +162,48 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
         )
     )
 
-    # 7. Step count
-    steps = db.scalar(
-        select(func.sum(HealthSample.value)).where(
+    # 7. Step count with smart multi-device deduplication (Apple Watch vs iPhone)
+    step_samples = db.scalars(
+        select(HealthSample).where(
             HealthSample.deleted_at.is_(None),
             HealthSample.sample_type.in_(["step_count", "steps"]),
             HealthSample.measured_at >= start_dt,
             HealthSample.measured_at <= end_dt,
-        )
-    )
+        ).order_by(HealthSample.measured_at.asc())
+    ).all()
+
+    watch_step_samples: list[HealthSample] = []
+    phone_step_samples: list[HealthSample] = []
+    other_step_samples: list[HealthSample] = []
+
+    for s in step_samples:
+        dev = str((s.extra or {}).get("device") or "").lower()
+        if "watch" in dev:
+            watch_step_samples.append(s)
+        elif "phone" in dev:
+            phone_step_samples.append(s)
+        else:
+            other_step_samples.append(s)
+
+    total_steps: Decimal = Decimal(0)
+    if watch_step_samples and phone_step_samples:
+        total_steps += sum((s.value for s in watch_step_samples), Decimal(0))
+        for p in phone_step_samples:
+            p_start = p.measured_at
+            p_end = p.ended_at if (p.ended_at and p.ended_at > p.measured_at) else p.measured_at + timedelta(seconds=300)
+            overlaps = any(
+                max(p_start, w.measured_at) <= min(p_end, w.ended_at if (w.ended_at and w.ended_at > w.measured_at) else w.measured_at + timedelta(seconds=300))
+                for w in watch_step_samples
+            )
+            if not overlaps:
+                total_steps += p.value
+        total_steps += sum((s.value for s in other_step_samples), Decimal(0))
+    elif watch_step_samples:
+        total_steps = sum((s.value for s in watch_step_samples), Decimal(0)) + sum((s.value for s in other_step_samples), Decimal(0))
+    else:
+        total_steps = sum((s.value for s in step_samples), Decimal(0))
+
+    steps = total_steps if step_samples else None
 
     # Find or create daily biometric_measurement
     measurement = db.scalar(
