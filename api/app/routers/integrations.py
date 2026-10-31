@@ -127,15 +127,30 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
         .limit(1)
     )
 
-    # 5. Sleep duration (sum of seconds)
-    sleep_s = db.scalar(
-        select(func.sum(HealthSample.value)).where(
+    # 5. Sleep duration (sum of seconds, stage-aware)
+    sleep_samples = db.scalars(
+        select(HealthSample).where(
             HealthSample.deleted_at.is_(None),
             HealthSample.sample_type.in_(["sleep", "sleep_duration", "sleep_duration_s", "sleep_analysis"]),
             HealthSample.measured_at >= start_dt,
             HealthSample.measured_at <= end_dt,
         )
-    )
+    ).all()
+
+    sleep_total_s = 0
+    sleep_deep_s = 0
+    sleep_rem_s = 0
+    has_sleep = len(sleep_samples) > 0
+    for s in sleep_samples:
+        stage = str((s.extra or {}).get("stage") or "").strip().lower()
+        if stage in ("awake", "inbed", "in_bed", "in bed"):
+            continue
+        val = int(round(s.value))
+        sleep_total_s += val
+        if stage == "deep":
+            sleep_deep_s += val
+        elif stage == "rem":
+            sleep_rem_s += val
 
     # 6. Active energy
     energy_kcal = db.scalar(
@@ -184,8 +199,12 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
         measurement.resting_hr_bpm = int(round(rhr))
     if hrv is not None:
         measurement.hrv_ms = hrv
-    if sleep_s is not None:
-        measurement.sleep_duration_s = int(round(sleep_s))
+    if has_sleep:
+        measurement.sleep_duration_s = sleep_total_s
+        if sleep_deep_s > 0:
+            measurement.sleep_deep_s = sleep_deep_s
+        if sleep_rem_s > 0:
+            measurement.sleep_rem_s = sleep_rem_s
     if energy_kcal is not None:
         measurement.active_energy_kcal = int(round(energy_kcal))
     if steps is not None:
