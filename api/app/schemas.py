@@ -253,6 +253,27 @@ def _to_list(val: Any) -> list[Any]:
     return [val]
 
 
+def _parse_duration_seconds(v: Any) -> Decimal | None:
+    """Parses duration from seconds, 'MM:SS', or 'HH:MM:SS' string into seconds."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float, Decimal)):
+        return Decimal(str(v))
+    if isinstance(v, str):
+        v = v.strip()
+        if ":" in v:
+            parts = v.split(":")
+            try:
+                if len(parts) == 2:
+                    return Decimal(int(parts[0]) * 60 + int(parts[1]))
+                elif len(parts) == 3:
+                    return Decimal(int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
+            except (ValueError, TypeError):
+                pass
+        return _clean_numeric(v)
+    return None
+
+
 class AppleHealthComprehensiveSyncPayload(BaseModel):
     """Universal payload for high-resolution multi-metric Apple Health synchronization."""
 
@@ -308,30 +329,73 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
         for prefix in prefixes:
             s_dates = _to_list(extra_fields.get(f"{prefix}_start_dates") or extra_fields.get(f"{prefix}_dates"))
             e_dates = _to_list(extra_fields.get(f"{prefix}_end_dates"))
-            vals = _to_list(
+            durations = _to_list(extra_fields.get(f"{prefix}_durations"))
+            raw_vals = _to_list(
                 extra_fields.get(f"{prefix}_values")
-                or extra_fields.get(f"{prefix}_durations")
                 or extra_fields.get(prefix)
             )
             canonical_type = METRIC_ALIASES.get(prefix, prefix)
             default_unit = DEFAULT_METRIC_UNITS.get(canonical_type)
             unit = extra_fields.get(f"{prefix}_unit") or default_unit
 
-            if s_dates and vals:
-                for i, (st, val) in enumerate(zip(s_dates, vals)):
+            if canonical_type == "sleep":
+                stages = extra_fields.get(f"{prefix}_stages") or (
+                    raw_vals if raw_vals and any(isinstance(x, str) and not re.match(r"^[\d\.:]+$", str(x).strip()) for x in raw_vals) else []
+                )
+                stage_list = _to_list(stages)
+                max_len = max(len(s_dates), len(e_dates), len(durations), len(raw_vals), len(stage_list))
+
+                for i in range(max_len):
+                    st = s_dates[i] if i < len(s_dates) else None
+                    if not st:
+                        continue
                     end = e_dates[i] if i < len(e_dates) else st
-                    cleaned_val = _clean_numeric(val)
-                    if cleaned_val is not None:
+                    dur = durations[i] if i < len(durations) else None
+                    val = raw_vals[i] if i < len(raw_vals) else None
+                    stage = stage_list[i] if i < len(stage_list) else None
+
+                    duration_s: Decimal | None = None
+                    st_dt = _clean_datetime(st)
+                    end_dt = _clean_datetime(end)
+                    if isinstance(st_dt, datetime) and isinstance(end_dt, datetime) and end_dt > st_dt:
+                        duration_s = Decimal(str(round((end_dt - st_dt).total_seconds(), 2)))
+                    elif dur:
+                        duration_s = _parse_duration_seconds(dur)
+                    elif val and (isinstance(val, (int, float, Decimal)) or (isinstance(val, str) and re.match(r"^[\d\.:]+$", val.strip()))):
+                        duration_s = _parse_duration_seconds(val)
+
+                    if duration_s is not None and duration_s > 0:
+                        extra_meta = {}
+                        if stage and isinstance(stage, str) and stage.strip():
+                            extra_meta["stage"] = stage.strip()
                         items.append(
                             HealthSampleItem(
                                 measured_at=st,
                                 ended_at=end,
-                                value=cleaned_val,
-                                sample_type=canonical_type,
-                                unit=unit,
+                                value=duration_s,
+                                sample_type="sleep",
+                                unit="s",
                                 source=self.source,
+                                extra=extra_meta,
                             )
                         )
+            else:
+                vals = raw_vals or durations
+                if s_dates and vals:
+                    for i, (st, val) in enumerate(zip(s_dates, vals)):
+                        end = e_dates[i] if i < len(e_dates) else st
+                        cleaned_val = _clean_numeric(val)
+                        if cleaned_val is not None:
+                            items.append(
+                                HealthSampleItem(
+                                    measured_at=st,
+                                    ended_at=end,
+                                    value=cleaned_val,
+                                    sample_type=canonical_type,
+                                    unit=unit,
+                                    source=self.source,
+                                )
+                            )
 
         # 3. Process root-level metric fields: e.g. {"sample_type": "active_energy", "dates": [...], "values": [...]}
         root_st = extra_fields.get("sample_type")

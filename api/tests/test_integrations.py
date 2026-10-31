@@ -211,3 +211,72 @@ def test_apple_health_sync_human_locale_date_format(client) -> None:
     assert res.status_code == 201
     assert res.json()["total_samples_ingested"] == 2
     assert res.json()["metrics_summary"]["active_energy"] == 2
+
+
+def test_apple_health_sync_sleep_stages_and_duration(client, db) -> None:
+    from app.models import BiometricMeasurement, HealthSample
+    from sqlalchemy import select
+
+    today = dt.date.today()
+    t1_s = dt.datetime.combine(today, dt.time(1, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t1_e = dt.datetime.combine(today, dt.time(1, 30)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    t2_s = dt.datetime.combine(today, dt.time(1, 30)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t2_e = dt.datetime.combine(today, dt.time(2, 30)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    t3_s = dt.datetime.combine(today, dt.time(2, 30)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t3_e = dt.datetime.combine(today, dt.time(2, 45)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    payload = {
+        "sleep_start_dates": f"{t1_s}\n{t2_s}\n{t3_s}",
+        "sleep_end_dates": f"{t1_e}\n{t2_e}\n{t3_e}",
+        "sleep_values": "Deep\nCore\nAwake",
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+    assert res.json()["total_samples_ingested"] == 3
+    assert res.json()["metrics_summary"]["sleep"] == 3
+
+    samples = db.scalars(
+        select(HealthSample).where(HealthSample.sample_type == "sleep").order_by(HealthSample.measured_at.asc())
+    ).all()
+    assert len(samples) == 3
+    assert samples[0].extra.get("stage") == "Deep"
+    assert samples[0].value == Decimal("1800")
+    assert samples[1].extra.get("stage") == "Core"
+    assert samples[1].value == Decimal("3600")
+    assert samples[2].extra.get("stage") == "Awake"
+    assert samples[2].value == Decimal("900")
+
+    measurement = db.scalar(select(BiometricMeasurement))
+    assert measurement is not None
+    assert measurement.sleep_duration_s == 5400
+    assert measurement.sleep_deep_s == 1800
+    assert measurement.sleep_rem_s is None
+
+
+def test_apple_health_sync_duration_string_parsing(client, db) -> None:
+    from app.models import HealthSample
+    from sqlalchemy import select
+
+    today = dt.date.today()
+    t1_s = dt.datetime.combine(today, dt.time(3, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t2_s = dt.datetime.combine(today, dt.time(3, 30)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    payload = {
+        "sleep_start_dates": f"{t1_s}\n{t2_s}",
+        "sleep_durations": "19:25\n1:18:43",
+        "sleep_values": "REM\nDeep",
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+    assert res.json()["total_samples_ingested"] == 2
+
+    samples = db.scalars(
+        select(HealthSample).where(HealthSample.sample_type == "sleep").order_by(HealthSample.measured_at.asc())
+    ).all()
+    assert len(samples) == 2
+    assert samples[0].value == Decimal("1165")
+    assert samples[0].extra.get("stage") == "REM"
+    assert samples[1].value == Decimal("4723")
+    assert samples[1].extra.get("stage") == "Deep"
