@@ -295,11 +295,15 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
                 s_dates = _to_list(data.get("start_dates") or data.get("dates"))
                 e_dates = _to_list(data.get("end_dates"))
                 vals = _to_list(data.get("values") or data.get("durations"))
+                sources = _to_list(data.get("sources") or data.get("devices"))
                 unit = data.get("unit") or default_unit
                 for i, (st, val) in enumerate(zip(s_dates, vals)):
                     end = e_dates[i] if i < len(e_dates) else st
                     cleaned_val = _clean_numeric(val)
                     if cleaned_val is not None:
+                        extra_meta = {}
+                        if i < len(sources) and sources[i]:
+                            extra_meta["device"] = str(sources[i]).strip()
                         items.append(
                             HealthSampleItem(
                                 measured_at=st,
@@ -308,6 +312,7 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
                                 sample_type=canonical_type,
                                 unit=unit,
                                 source=self.source,
+                                extra=extra_meta,
                             )
                         )
 
@@ -330,6 +335,11 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
             s_dates = _to_list(extra_fields.get(f"{prefix}_start_dates") or extra_fields.get(f"{prefix}_dates"))
             e_dates = _to_list(extra_fields.get(f"{prefix}_end_dates"))
             durations = _to_list(extra_fields.get(f"{prefix}_durations"))
+            sources = _to_list(
+                extra_fields.get(f"{prefix}_sources")
+                or extra_fields.get(f"{prefix}_devices")
+                or extra_fields.get(f"{prefix}_source_names")
+            )
             raw_vals = _to_list(
                 extra_fields.get(f"{prefix}_values")
                 or extra_fields.get(prefix)
@@ -343,7 +353,7 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
                     raw_vals if raw_vals and any(isinstance(x, str) and not re.match(r"^[\d\.:]+$", str(x).strip()) for x in raw_vals) else []
                 )
                 stage_list = _to_list(stages)
-                max_len = max(len(s_dates), len(e_dates), len(durations), len(raw_vals), len(stage_list))
+                max_len = max(len(s_dates), len(e_dates), len(durations), len(raw_vals), len(stage_list), len(sources))
 
                 for i in range(max_len):
                     st = s_dates[i] if i < len(s_dates) else None
@@ -368,6 +378,8 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
                         extra_meta = {}
                         if stage and isinstance(stage, str) and stage.strip():
                             extra_meta["stage"] = stage.strip()
+                        if i < len(sources) and sources[i]:
+                            extra_meta["device"] = str(sources[i]).strip()
                         items.append(
                             HealthSampleItem(
                                 measured_at=st,
@@ -386,6 +398,9 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
                         end = e_dates[i] if i < len(e_dates) else st
                         cleaned_val = _clean_numeric(val)
                         if cleaned_val is not None:
+                            extra_meta = {}
+                            if i < len(sources) and sources[i]:
+                                extra_meta["device"] = str(sources[i]).strip()
                             items.append(
                                 HealthSampleItem(
                                     measured_at=st,
@@ -394,6 +409,7 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
                                     sample_type=canonical_type,
                                     unit=unit,
                                     source=self.source,
+                                    extra=extra_meta,
                                 )
                             )
 
@@ -401,6 +417,7 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
         root_st = extra_fields.get("sample_type")
         root_dates = _to_list(extra_fields.get("start_dates") or extra_fields.get("dates"))
         root_vals = _to_list(extra_fields.get("values") or extra_fields.get("durations"))
+        root_sources = _to_list(extra_fields.get("sources") or extra_fields.get("devices"))
         if root_st and root_dates and root_vals:
             canonical_type = METRIC_ALIASES.get(root_st, root_st)
             default_unit = DEFAULT_METRIC_UNITS.get(canonical_type)
@@ -410,6 +427,9 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
                 end = root_e_dates[i] if i < len(root_e_dates) else st
                 cleaned_val = _clean_numeric(val)
                 if cleaned_val is not None:
+                    extra_meta = {}
+                    if i < len(root_sources) and root_sources[i]:
+                        extra_meta["device"] = str(root_sources[i]).strip()
                     items.append(
                         HealthSampleItem(
                             measured_at=st,
@@ -418,6 +438,7 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
                             sample_type=canonical_type,
                             unit=unit,
                             source=self.source,
+                            extra=extra_meta,
                         )
                     )
 

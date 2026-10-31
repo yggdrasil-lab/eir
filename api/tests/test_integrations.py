@@ -280,3 +280,45 @@ def test_apple_health_sync_duration_string_parsing(client, db) -> None:
     assert samples[0].extra.get("stage") == "REM"
     assert samples[1].value == Decimal("4723")
     assert samples[1].extra.get("stage") == "Deep"
+
+
+def test_apple_health_sync_smart_step_deduplication(client, db) -> None:
+    from app.models import BiometricMeasurement, HealthSample
+    from sqlalchemy import select
+
+    today = dt.date.today()
+    # 2 Watch intervals (12:00-12:10 = 200 steps, 12:10-12:20 = 300 steps) -> 500 steps
+    w1_s = dt.datetime.combine(today, dt.time(12, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    w1_e = dt.datetime.combine(today, dt.time(12, 10)).replace(tzinfo=dt.timezone.utc).isoformat()
+    w2_s = dt.datetime.combine(today, dt.time(12, 10)).replace(tzinfo=dt.timezone.utc).isoformat()
+    w2_e = dt.datetime.combine(today, dt.time(12, 20)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    # 1 Overlapping Phone interval (12:05-12:15 = 250 steps) -> should be suppressed
+    p_ov_s = dt.datetime.combine(today, dt.time(12, 5)).replace(tzinfo=dt.timezone.utc).isoformat()
+    p_ov_e = dt.datetime.combine(today, dt.time(12, 15)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    # 1 Non-overlapping Phone interval when watch was charging (08:00-08:15 = 80 steps) -> should be counted
+    p_ch_s = dt.datetime.combine(today, dt.time(8, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    p_ch_e = dt.datetime.combine(today, dt.time(8, 15)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    payload = {
+        "step_start_dates": f"{w1_s}\n{w2_s}\n{p_ov_s}\n{p_ch_s}",
+        "step_end_dates": f"{w1_e}\n{w2_e}\n{p_ov_e}\n{p_ch_e}",
+        "step_values": "200\n300\n250\n80",
+        "step_sources": "Raymund's Apple Watch\nRaymund's Apple Watch\nRaymund's iPhone\nRaymund's iPhone",
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+    assert res.json()["total_samples_ingested"] == 4
+
+    samples = db.scalars(
+        select(HealthSample).where(HealthSample.sample_type == "step_count").order_by(HealthSample.measured_at.asc())
+    ).all()
+    assert len(samples) == 4
+    assert samples[0].extra.get("device") == "Raymund's iPhone"
+    assert samples[1].extra.get("device") == "Raymund's Apple Watch"
+
+    # Rollup should count watch steps (200 + 300) + non-overlapping phone steps (80) = 580 (ignoring 250 overlapping phone steps)
+    measurement = db.scalar(select(BiometricMeasurement))
+    assert measurement is not None
+    assert measurement.step_count == 580
