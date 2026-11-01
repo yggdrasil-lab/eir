@@ -322,3 +322,128 @@ def test_apple_health_sync_smart_step_deduplication(client, db) -> None:
     measurement = db.scalar(select(BiometricMeasurement))
     assert measurement is not None
     assert measurement.step_count == 580
+
+
+def test_withings_authorize_endpoint(client, monkeypatch) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "withings_client_id", "test-client-id-123")
+    monkeypatch.setattr(settings, "withings_redirect_uri", "https://eir.tienzo.net/integrations/withings/callback")
+
+    res = client.get("/integrations/withings/authorize?format=json")
+    assert res.status_code == 200
+    data = res.json()
+    assert "https://account.withings.com/oauth2_user/authorize2" in data["authorization_url"]
+    assert "client_id=test-client-id-123" in data["authorization_url"]
+
+
+def test_withings_status_endpoint(client, db) -> None:
+    from app.models import OAuthToken
+
+    # Initially disconnected
+    res = client.get("/integrations/withings/status")
+    assert res.status_code == 200
+    assert res.json()["status"] == "disconnected"
+    assert res.json()["linked"] is False
+
+    # Insert token
+    token = OAuthToken(
+        provider="withings",
+        user_id="user-999",
+        access_token="acc-123",
+        refresh_token="ref-123",
+        scope="user.metrics",
+        expires_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=3),
+    )
+    db.add(token)
+    db.commit()
+
+    res = client.get("/integrations/withings/status")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "connected"
+    assert data["linked"] is True
+    assert data["user_id"] == "user-999"
+
+
+def test_cross_source_scale_deduplication(client, db) -> None:
+    from app.models import HealthSample
+    from sqlalchemy import select
+
+    today = dt.date.today()
+    # 1. Withings scale creates weight sample at 07:30:15 UTC (82.5 kg)
+    t_withings = dt.datetime.combine(today, dt.time(7, 30, 15)).replace(tzinfo=dt.timezone.utc)
+    s_withings = HealthSample(
+        source="withings",
+        sample_type="weight",
+        measured_at=t_withings,
+        ended_at=t_withings,
+        value=Decimal("82.5"),
+        unit="kg",
+        external_id="withings_12345_1",
+    )
+    db.add(s_withings)
+    db.commit()
+
+    # 2. Apple Health later sends the same weigh-in at 07:30:00 UTC (82.5 kg) within 15 seconds
+    t_apple = dt.datetime.combine(today, dt.time(7, 30, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    payload = {
+        "weight_dates": t_apple,
+        "weight_values": "82.5",
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+
+    # Should NOT have inserted a second row
+    samples = db.scalars(select(HealthSample).where(HealthSample.sample_type == "weight")).all()
+    assert len(samples) == 1
+    assert samples[0].value == Decimal("82.5")
+
+
+def test_unified_daily_rollup_merges_scale_and_wearables(client, db) -> None:
+    from app.models import BiometricMeasurement, HealthSample
+    from sqlalchemy import select
+
+    today = dt.date.today()
+    t_morning = dt.datetime.combine(today, dt.time(7, 0)).replace(tzinfo=dt.timezone.utc)
+
+    # 1. Withings creates body composition samples (weight, body fat %, muscle mass, water %)
+    samples = [
+        HealthSample(source="withings", sample_type="weight", measured_at=t_morning, ended_at=t_morning, value=Decimal("81.4"), unit="kg"),
+        HealthSample(source="withings", sample_type="body_fat_pct", measured_at=t_morning, ended_at=t_morning, value=Decimal("16.8"), unit="%"),
+        HealthSample(source="withings", sample_type="muscle_mass_kg", measured_at=t_morning, ended_at=t_morning, value=Decimal("64.2"), unit="kg"),
+        HealthSample(source="withings", sample_type="water_pct", measured_at=t_morning, ended_at=t_morning, value=Decimal("58.5"), unit="%"),
+    ]
+    for s in samples:
+        db.add(s)
+    db.commit()
+
+    # 2. Apple Watch syncs sleep and steps for the same day
+    t_sleep_s = dt.datetime.combine(today, dt.time(0, 30)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t_sleep_e = dt.datetime.combine(today, dt.time(7, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t_step_s = dt.datetime.combine(today, dt.time(8, 0)).replace(tzinfo=dt.timezone.utc).isoformat()
+    t_step_e = dt.datetime.combine(today, dt.time(8, 30)).replace(tzinfo=dt.timezone.utc).isoformat()
+
+    payload = {
+        "sleep_start_dates": t_sleep_s,
+        "sleep_end_dates": t_sleep_e,
+        "sleep_values": "Deep",
+        "step_start_dates": t_step_s,
+        "step_end_dates": t_step_e,
+        "step_values": "1500",
+    }
+    res = client.post("/integrations/apple-health/sync", json=payload)
+    assert res.status_code == 201
+
+    # Should have strictly ONE unified daily biometric_measurement row merging both sources
+    measurements = db.scalars(select(BiometricMeasurement)).all()
+    assert len(measurements) == 1
+    m = measurements[0]
+    assert float(m.weight_kg) == 81.4
+    assert float(m.body_fat_pct) == 16.8
+    assert float(m.muscle_mass_kg) == 64.2
+    assert float(m.water_pct) == 58.5
+    assert m.sleep_duration_s == 23400  # 6.5 hours
+    assert m.sleep_deep_s == 23400
+    assert m.step_count == 1500
+

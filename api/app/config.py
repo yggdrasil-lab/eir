@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     mcp_token: str | None = None
     webhook_secret: str | None = None
     timezone: str = "Pacific/Auckland"
+    withings_client_id: str | None = None
+    withings_client_secret: str | None = None
+    withings_redirect_uri: str | None = None
 
     @property
     def tz(self) -> zoneinfo.ZoneInfo:

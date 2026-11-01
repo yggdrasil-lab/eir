@@ -92,3 +92,27 @@ class HealthSample(TimestampMixin, Base):
             postgresql_where=text("deleted_at is null"),
         ),
     )
+
+
+class OAuthToken(TimestampMixin, Base):
+    """OAuth2 tokens for external health providers (Withings, etc.)."""
+
+    __tablename__ = "oauth_token"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    provider: Mapped[str] = mapped_column(Text, nullable=False, default="withings")
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token: Mapped[str] = mapped_column(Text, nullable=False)
+    scope: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index(
+            "oauth_token_provider_user_idx",
+            provider,
+            user_id,
+            unique=True,
+            postgresql_where=text("deleted_at is null"),
+        ),
+    )

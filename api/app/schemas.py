@@ -75,6 +75,17 @@ class WithingsNotificationPayload(BaseModel):
     enddate: int | None = None
 
 
+class WithingsAuthStatusResponse(BaseModel):
+    """Status of Withings OAuth2 connection."""
+
+    status: str
+    linked: bool
+    provider: str = "withings"
+    user_id: str | None = None
+    expires_at: datetime | None = None
+    scope: str | None = None
+
+
 # ----------------------------------------------------------------- Biometrics
 class BiometricCreate(BaseModel):
     """Manual biometric entry."""
@@ -213,6 +224,9 @@ DEFAULT_METRIC_UNITS: dict[str, str] = {
     "weight": "kg",
     "body_fat": "%",
     "body_fat_pct": "%",
+    "muscle_mass_kg": "kg",
+    "bone_mass_kg": "kg",
+    "water_pct": "%",
     "distance": "m",
     "flights": "count",
     "vo2_max": "ml/kg/min",
@@ -225,6 +239,11 @@ METRIC_ALIASES: dict[str, str] = {
     "weight_kg": "weight",
     "body_fat_percentage": "body_fat_pct",
     "body_fat": "body_fat_pct",
+    "muscle_mass": "muscle_mass_kg",
+    "lean_body_mass": "muscle_mass_kg",
+    "bone_mass": "bone_mass_kg",
+    "water_percentage": "water_pct",
+    "hydration_pct": "water_pct",
     "resting_heart_rate": "resting_hr",
     "resting_hr_bpm": "resting_hr",
     "heart_rate_variability": "hrv",
