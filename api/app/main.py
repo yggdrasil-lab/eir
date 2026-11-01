@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
 from app.config import settings
-from app.routers import biometrics, health, integrations
+from app.routers import biometrics, feedback, health, integrations
 from app.routers.mcp import install_mcp
 
 app = FastAPI(
@@ -24,6 +24,7 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(biometrics.router)
+app.include_router(feedback.router)
 app.include_router(integrations.router)
 
 install_mcp(app)

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
-from app.models import BiometricMeasurement, HealthSample
+from app.models import BiometricMeasurement, HealthFeedback, HealthSample
 from app.schemas import BiometricCreate, BiometricRead, DailyBiometricSummary, HealthSampleRead
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
@@ -121,6 +121,19 @@ def get_daily_summary(
     )
     if granular_steps is not None:
         summary.step_count = int(round(granular_steps))
+
+    # Active feedbacks for this day
+    feedback_stmt = select(HealthFeedback).where(
+        HealthFeedback.deleted_at.is_(None),
+        HealthFeedback.date == target_date,
+    )
+    for fb in db.scalars(feedback_stmt):
+        if fb.feedback_type == "fasting":
+            summary.fasting = fb
+        elif fb.feedback_type == "workout":
+            summary.workout = fb
+        elif fb.feedback_type == "wellness":
+            summary.wellness = fb
 
     summary.readiness_notes = readiness_notes
     return summary

@@ -131,6 +131,60 @@ class BiometricRead(ORMModel):
     created_at: datetime
 
 
+# ------------------------------------------------------------- Active Health Feedback
+class HealthFeedbackBase(BaseModel):
+    date: date
+    feedback_type: str  # 'fasting', 'workout', 'wellness', 'sport'
+    rating: str | None = None  # 'completed', 'optimal', 'too_hard', etc.
+    score: Decimal | None = None  # 1.0 - 10.0 scale
+    tags: list[str] = Field(default_factory=list)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    notes: str | None = None
+    logged_at: datetime = Field(default_factory=datetime.now)
+
+
+class HealthFeedbackCreate(HealthFeedbackBase):
+    pass
+
+
+class HealthFeedbackRead(ORMModel, HealthFeedbackBase):
+    id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+
+class FastingFeedbackCreate(BaseModel):
+    date: date
+    target_window: str = "16:8"
+    adherence: str  # 'completed', 'early', 'off_plan'
+    energy: str = "normal"  # 'high', 'normal', 'low'
+    headache: str = "none"  # 'none', 'mild', 'sugar_spike'
+    notes: str | None = None
+    logged_at: datetime = Field(default_factory=datetime.now)
+
+
+class WorkoutFeedbackCreate(BaseModel):
+    date: date
+    routine_name: str | None = None
+    duration_minutes: int | None = None
+    total_volume_kg: Decimal | None = None
+    completed_sets: int | None = None
+    effort_rating: str  # 'too_easy', 'optimal', 'hard', 'too_hard'
+    tags: list[str] = Field(default_factory=list)
+    notes: str | None = None
+    logged_at: datetime = Field(default_factory=datetime.now)
+
+
+class WellnessFeedbackCreate(BaseModel):
+    date: date
+    readiness_rating: str | None = None  # 'high', 'moderate', 'low'
+    soreness_score: Decimal | None = None  # 1.0 - 5.0
+    sore_areas: list[str] = Field(default_factory=list)  # e.g. ['Legs', 'Back']
+    stress_level: str | None = None  # 'low', 'normal', 'high'
+    notes: str | None = None
+    logged_at: datetime = Field(default_factory=datetime.now)
+
+
 class DailyBiometricSummary(BaseModel):
     """Daily aggregated vitals rollup for morning briefings and retrospectives."""
 
@@ -145,6 +199,9 @@ class DailyBiometricSummary(BaseModel):
     step_count: int | None = None
     active_energy_kcal: int | None = None
     readiness_notes: list[str] = Field(default_factory=list)
+    fasting: HealthFeedbackRead | None = None
+    workout: HealthFeedbackRead | None = None
+    wellness: HealthFeedbackRead | None = None
 
 
 # ------------------------------------------------------------- Granular Samples
