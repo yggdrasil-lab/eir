@@ -41,6 +41,9 @@ services:
       - EIR_DATABASE_URL=postgresql+psycopg://eir:eir@eir-db:5432/eir
       - EIR_ENVIRONMENT=production
       - EIR_MCP_TOKEN_FILE=/run/secrets/eir_mcp_token
+      - EIR_WITHINGS_CLIENT_ID=${EIR_WITHINGS_CLIENT_ID}
+      - EIR_WITHINGS_CLIENT_SECRET=${EIR_WITHINGS_CLIENT_SECRET}
+      - EIR_WITHINGS_REDIRECT_URI=${EIR_WITHINGS_REDIRECT_URI}
       - TZ=Pacific/Auckland
     secrets:
       - eir_mcp_token

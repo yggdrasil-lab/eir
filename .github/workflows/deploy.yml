@@ -44,6 +44,9 @@ jobs:
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
           EIR_DB_MOUNT_PATH: ${{ vars.EIR_DB_MOUNT_PATH || '/opt/eir/data' }}
+          EIR_WITHINGS_CLIENT_ID: ${{ vars.EIR_WITHINGS_CLIENT_ID || '' }}
+          EIR_WITHINGS_CLIENT_SECRET: ${{ secrets.EIR_WITHINGS_CLIENT_SECRET || '' }}
+          EIR_WITHINGS_REDIRECT_URI: ${{ vars.EIR_WITHINGS_REDIRECT_URI || '' }}
           IMAGE_TAG: eir
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh

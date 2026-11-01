@@ -10,6 +10,10 @@ if [ -n "${EIR_WEBHOOK_SECRET_FILE:-}" ]; then
     EIR_WEBHOOK_SECRET=$(cat "$EIR_WEBHOOK_SECRET_FILE")
     export EIR_WEBHOOK_SECRET
 fi
+if [ -n "${EIR_WITHINGS_CLIENT_SECRET_FILE:-}" ]; then
+    EIR_WITHINGS_CLIENT_SECRET=$(cat "$EIR_WITHINGS_CLIENT_SECRET_FILE")
+    export EIR_WITHINGS_CLIENT_SECRET
+fi
 
 # Retry database migration until Postgres accepts connections.
 attempt=1
