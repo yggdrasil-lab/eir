@@ -360,8 +360,10 @@ def sync_apple_health_comprehensive(
         # Check cross-source scale deduplication (e.g. sample already exists from Withings within +-60s)
         matched_scale_sample = None
         if st in scale_types:
+            it_dt = item.measured_at if item.measured_at.tzinfo else item.measured_at.replace(tzinfo=timezone.utc)
             for s in existing_samples_in_range:
-                if s.sample_type == st and abs((s.measured_at - item.measured_at).total_seconds()) <= 60:
+                s_dt = s.measured_at if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=timezone.utc)
+                if s.sample_type == st and abs((s_dt - it_dt).total_seconds()) <= 60:
                     matched_scale_sample = s
                     break
 

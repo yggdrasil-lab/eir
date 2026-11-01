@@ -1,10 +1,11 @@
 """SQLAlchemy models for Eir health and biometric records."""
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 import uuid
 
 from sqlalchemy import (
+    Date,
     DateTime,
     Index,
     Integer,
@@ -112,6 +113,34 @@ class OAuthToken(TimestampMixin, Base):
             "oauth_token_provider_user_idx",
             provider,
             user_id,
+            unique=True,
+            postgresql_where=text("deleted_at is null"),
+        ),
+    )
+
+
+class HealthFeedback(TimestampMixin, Base):
+    """Subjective and behavioral feedback records (fasting, workout effort, wellness)."""
+
+    __tablename__ = "health_feedback"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    feedback_type: Mapped[str] = mapped_column(Text, nullable=False)  # 'fasting', 'workout', 'wellness', 'sport'
+    rating: Mapped[str | None] = mapped_column(Text, nullable=True)  # 'completed', 'optimal', 'too_hard', etc.
+    score: Mapped[Decimal | None] = mapped_column(Numeric(4, 2), nullable=True)  # 1.0 - 10.0 scale
+    tags: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    logged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("health_feedback_date_idx", date.desc(), postgresql_where=text("deleted_at is null")),
+        Index("health_feedback_type_date_idx", feedback_type, date.desc(), postgresql_where=text("deleted_at is null")),
+        Index(
+            "health_feedback_dedup_idx",
+            date,
+            feedback_type,
             unique=True,
             postgresql_where=text("deleted_at is null"),
         ),
