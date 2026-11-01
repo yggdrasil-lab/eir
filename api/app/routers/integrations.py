@@ -625,7 +625,6 @@ async def _get_valid_withings_token(db: Session, user_id: str | None = None) -> 
 async def withings_webhook_callback(
     request: Request,
     db: Session = Depends(get_db),
-    _: None = Depends(verify_webhook_token),
 ):
     """Receives Withings notifications when a user steps on the scale, then fetches and ingests measurements."""
     payload = {}
