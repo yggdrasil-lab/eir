@@ -170,16 +170,8 @@ def build_mcp_server() -> MCPServer:
             if granular_active_energy is not None:
                 summary["active_energy_kcal"] = int(round(granular_active_energy))
 
-            granular_steps = db.scalar(
-                select(func.sum(HealthSample.value)).where(
-                    HealthSample.deleted_at.is_(None),
-                    HealthSample.sample_type == "step_count",
-                    HealthSample.measured_at >= start_dt,
-                    HealthSample.measured_at <= end_dt,
-                )
-            )
-            if granular_steps is not None:
-                summary["step_count"] = int(round(granular_steps))
+            # Step count comes from the deduplicated BiometricMeasurement rollup only;
+            # naively summing granular samples would double-count Watch/iPhone overlap.
 
             return json.dumps(summary)
 

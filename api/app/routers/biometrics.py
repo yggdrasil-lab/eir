@@ -111,16 +111,9 @@ def get_daily_summary(
     if granular_active_energy is not None:
         summary.active_energy_kcal = int(round(granular_active_energy))
 
-    granular_steps = db.scalar(
-        select(func.sum(HealthSample.value)).where(
-            HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type == "step_count",
-            HealthSample.measured_at >= start_dt,
-            HealthSample.measured_at <= end_dt,
-        )
-    )
-    if granular_steps is not None:
-        summary.step_count = int(round(granular_steps))
+    # Step count intentionally comes from the BiometricMeasurement rollup only:
+    # integrations.py already deduplicates overlapping Watch/iPhone intervals there,
+    # so naively summing granular step samples would double-count steps.
 
     # Active feedbacks for this day
     feedback_stmt = select(HealthFeedback).where(

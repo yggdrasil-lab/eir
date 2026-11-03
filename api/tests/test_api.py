@@ -83,3 +83,50 @@ def test_daily_summary(client) -> None:
     assert summary["sleep_duration_hours"] == 8.0
     assert summary["sleep_deep_hours"] == 1.5
     assert summary["step_count"] == 10000
+
+
+def test_daily_summary_granular_steps_do_not_clobber_deduplicated_count(client, db) -> None:
+    """Overlapping Watch/iPhone samples must not override the deduplicated rollup step count."""
+    from decimal import Decimal
+
+    from app.config import settings
+    from app.models import BiometricMeasurement, HealthSample
+
+    today = dt.date.today()
+
+    def at(hour: int, minute: int) -> dt.datetime:
+        return dt.datetime.combine(today, dt.time(hour, minute)).replace(tzinfo=settings.tz)
+
+    # Deduplicated rollup (as written by the Apple Health sync): 200 + 300 watch + 80 non-overlapping phone
+    db.add(
+        BiometricMeasurement(
+            id=uuid.uuid4(),
+            measured_at=at(8, 0),
+            source="daily_rollup",
+            step_count=580,
+        )
+    )
+    # Granular samples whose naive sum (830) double-counts the overlapping 250-step phone interval
+    granular = [
+        ("Raymund's Apple Watch", at(12, 0), at(12, 10), "200"),
+        ("Raymund's Apple Watch", at(12, 10), at(12, 20), "300"),
+        ("Raymund's iPhone", at(12, 5), at(12, 15), "250"),
+        ("Raymund's iPhone", at(9, 0), at(9, 15), "80"),
+    ]
+    for device, start, end, value in granular:
+        db.add(
+            HealthSample(
+                source="apple_health",
+                sample_type="step_count",
+                measured_at=start,
+                ended_at=end,
+                value=Decimal(value),
+                unit="count",
+                extra={"device": device},
+            )
+        )
+    db.commit()
+
+    res = client.get(f"/biometrics/daily/{today.isoformat()}")
+    assert res.status_code == 200
+    assert res.json()["step_count"] == 580
