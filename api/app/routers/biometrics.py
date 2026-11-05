@@ -1,6 +1,6 @@
 """Biometrics router for reading and managing health time-series."""
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import uuid
 
@@ -11,9 +11,106 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import get_db
 from app.models import BiometricMeasurement, HealthFeedback, HealthSample
-from app.schemas import BiometricCreate, BiometricRead, DailyBiometricSummary, HealthSampleRead
+from app.schemas import (
+    BiometricCreate,
+    BiometricRead,
+    DailyBiometricSummary,
+    DetectedWorkoutRead,
+    HealthSampleRead,
+)
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
+
+
+def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWorkoutRead]:
+    """Infers sustained physical exertion blocks from granular active energy and heart rate samples."""
+    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
+    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
+
+    samples = list(
+        db.scalars(
+            select(HealthSample)
+            .where(
+                HealthSample.deleted_at.is_(None),
+                HealthSample.sample_type.in_(["active_energy", "heart_rate", "step_count"]),
+                HealthSample.measured_at >= start_dt,
+                HealthSample.measured_at <= end_dt,
+            )
+            .order_by(HealthSample.measured_at.asc())
+        )
+    )
+
+    if not samples:
+        return []
+
+    # Partition 24 hours into 288 5-minute slots
+    slots = [{"energy": Decimal(0), "hr_vals": [], "steps": Decimal(0)} for _ in range(288)]
+    for s in samples:
+        dt = s.measured_at.astimezone(settings.tz) if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=settings.tz)
+        offset = (dt - start_dt).total_seconds()
+        idx = int(offset // 300)
+        if 0 <= idx < 288:
+            if s.sample_type in ("active_energy", "active_energy_kcal"):
+                slots[idx]["energy"] += s.value
+            elif s.sample_type in ("heart_rate", "resting_hr"):
+                slots[idx]["hr_vals"].append(float(s.value))
+            elif s.sample_type in ("step_count", "steps"):
+                slots[idx]["steps"] += s.value
+
+    active_indices = []
+    for i, slot in enumerate(slots):
+        avg_hr = (sum(slot["hr_vals"]) / len(slot["hr_vals"])) if slot["hr_vals"] else None
+        # Exertion threshold: >= 20 kcal in 5m (~4 kcal/min) OR average HR in 5m >= 120 bpm
+        is_active = (slot["energy"] >= Decimal(20)) or (avg_hr is not None and avg_hr >= 120.0)
+        if is_active:
+            active_indices.append(i)
+
+    if not active_indices:
+        return []
+
+    # Merge clusters with max gap of 3 slots (15 minutes) to bridge rest/water intervals
+    clusters: list[tuple[int, int]] = []
+    curr = [active_indices[0]]
+    for idx in active_indices[1:]:
+        if idx - curr[-1] <= 3:
+            curr.append(idx)
+        else:
+            clusters.append((curr[0], curr[-1]))
+            curr = [idx]
+    if curr:
+        clusters.append((curr[0], curr[-1]))
+
+    detected: list[DetectedWorkoutRead] = []
+    for start_idx, end_idx in clusters:
+        duration_mins = (end_idx - start_idx + 1) * 5
+        block_energy = sum((slots[i]["energy"] for i in range(start_idx, end_idx + 1)), Decimal(0))
+        block_steps = sum((slots[i]["steps"] for i in range(start_idx, end_idx + 1)), Decimal(0))
+        all_hrs: list[float] = []
+        for i in range(start_idx, end_idx + 1):
+            all_hrs.extend(slots[i]["hr_vals"])
+
+        avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
+        peak_hr = int(round(max(all_hrs))) if all_hrs else None
+
+        # Filter noise: minimum 30 minutes AND (active energy >= 250 kcal OR avg HR >= 120)
+        if duration_mins >= 30 and (block_energy >= Decimal(250) or (avg_hr is not None and avg_hr >= 120)):
+            s_time = start_dt + timedelta(minutes=start_idx * 5)
+            e_time = start_dt + timedelta(minutes=(end_idx + 1) * 5)
+            conf = "high" if (avg_hr and avg_hr >= 130 and block_energy >= Decimal(350)) else "medium"
+            detected.append(
+                DetectedWorkoutRead(
+                    started_at=s_time,
+                    ended_at=e_time,
+                    duration_minutes=duration_mins,
+                    active_energy_kcal=int(round(block_energy)),
+                    avg_hr_bpm=avg_hr,
+                    peak_hr_bpm=peak_hr,
+                    step_count=int(round(block_steps)) if block_steps > 0 else None,
+                    confidence=conf,
+                )
+            )
+
+    return detected
 
 
 @router.get("/granular", response_model=list[HealthSampleRead])
@@ -129,7 +226,17 @@ def get_daily_summary(
             summary.wellness = fb
 
     summary.readiness_notes = readiness_notes
+    summary.detected_workouts = detect_workouts_for_day(db, target_date)
     return summary
+
+
+@router.get("/detected-workouts", response_model=list[DetectedWorkoutRead])
+def get_detected_workouts(
+    target_date: date = Query(description="Calendar date (YYYY-MM-DD)"),
+    db: Session = Depends(get_db),
+) -> list[DetectedWorkoutRead]:
+    """Scans high-resolution biometrics to detect unlogged physical exertion blocks."""
+    return detect_workouts_for_day(db, target_date)
 
 
 @router.get("", response_model=list[BiometricRead])

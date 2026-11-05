@@ -185,6 +185,19 @@ class WellnessFeedbackCreate(BaseModel):
     logged_at: datetime = Field(default_factory=datetime.now)
 
 
+class DetectedWorkoutRead(BaseModel):
+    """Sustained physical exertion block inferred from heart rate and active energy telemetry."""
+
+    started_at: datetime
+    ended_at: datetime
+    duration_minutes: int
+    active_energy_kcal: int
+    avg_hr_bpm: int | None = None
+    peak_hr_bpm: int | None = None
+    step_count: int | None = None
+    confidence: str = "medium"  # 'high', 'medium'
+
+
 class DailyBiometricSummary(BaseModel):
     """Daily aggregated vitals rollup for morning briefings and retrospectives."""
 
@@ -202,6 +215,7 @@ class DailyBiometricSummary(BaseModel):
     fasting: HealthFeedbackRead | None = None
     workout: HealthFeedbackRead | None = None
     wellness: HealthFeedbackRead | None = None
+    detected_workouts: list[DetectedWorkoutRead] = Field(default_factory=list)
 
 
 # ------------------------------------------------------------- Granular Samples
