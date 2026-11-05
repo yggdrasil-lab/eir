@@ -18,6 +18,7 @@ from app.schemas import (
     DetectedWorkoutRead,
     HealthSampleRead,
 )
+from app.services.biometrics import deduplicate_step_samples
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
 
@@ -43,8 +44,8 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
     if not samples:
         return []
 
-    # Partition 24 hours into 288 5-minute slots
-    slots = [{"energy": Decimal(0), "hr_vals": [], "steps": Decimal(0)} for _ in range(288)]
+    # Partition 24 hours into 288 5-minute slots for exertion thresholding
+    slots = [{"energy": Decimal(0), "hr_vals": []} for _ in range(288)]
     for s in samples:
         dt = s.measured_at.astimezone(settings.tz) if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=settings.tz)
         offset = (dt - start_dt).total_seconds()
@@ -54,8 +55,6 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                 slots[idx]["energy"] += s.value
             elif s.sample_type in ("heart_rate", "resting_hr"):
                 slots[idx]["hr_vals"].append(float(s.value))
-            elif s.sample_type in ("step_count", "steps"):
-                slots[idx]["steps"] += s.value
 
     active_indices = []
     for i, slot in enumerate(slots):
@@ -84,7 +83,6 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
     for start_idx, end_idx in clusters:
         duration_mins = (end_idx - start_idx + 1) * 5
         block_energy = sum((slots[i]["energy"] for i in range(start_idx, end_idx + 1)), Decimal(0))
-        block_steps = sum((slots[i]["steps"] for i in range(start_idx, end_idx + 1)), Decimal(0))
         all_hrs: list[float] = []
         for i in range(start_idx, end_idx + 1):
             all_hrs.extend(slots[i]["hr_vals"])
@@ -96,6 +94,14 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
         if duration_mins >= 30 and (block_energy >= Decimal(250) or (avg_hr is not None and avg_hr >= 120)):
             s_time = start_dt + timedelta(minutes=start_idx * 5)
             e_time = start_dt + timedelta(minutes=(end_idx + 1) * 5)
+            # Centralized multi-device step deduplication for the workout window
+            cluster_steps = [
+                s for s in samples
+                if s.sample_type in ("step_count", "steps")
+                and s_time <= (s.measured_at.astimezone(settings.tz) if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=settings.tz)) < e_time
+            ]
+            block_steps = deduplicate_step_samples(cluster_steps)
+
             conf = "high" if (avg_hr and avg_hr >= 130 and block_energy >= Decimal(350)) else "medium"
             detected.append(
                 DetectedWorkoutRead(
@@ -208,9 +214,20 @@ def get_daily_summary(
     if granular_active_energy is not None:
         summary.active_energy_kcal = int(round(granular_active_energy))
 
-    # Step count intentionally comes from the BiometricMeasurement rollup only:
-    # integrations.py already deduplicates overlapping Watch/iPhone intervals there,
-    # so naively summing granular step samples would double-count steps.
+    # Step count comes from BiometricMeasurement rollup or deduplicated granular samples
+    if summary.step_count is None:
+        raw_steps = list(
+            db.scalars(
+                select(HealthSample).where(
+                    HealthSample.deleted_at.is_(None),
+                    HealthSample.sample_type.in_(["step_count", "steps"]),
+                    HealthSample.measured_at >= start_dt,
+                    HealthSample.measured_at <= end_dt,
+                )
+            )
+        )
+        if raw_steps:
+            summary.step_count = int(round(deduplicate_step_samples(raw_steps)))
 
     # Active feedbacks for this day
     feedback_stmt = select(HealthFeedback).where(
