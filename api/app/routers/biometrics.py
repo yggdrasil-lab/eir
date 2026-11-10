@@ -45,7 +45,7 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
         return []
 
     # Partition 24 hours into 288 5-minute slots for exertion thresholding
-    slots = [{"energy": Decimal(0), "hr_vals": []} for _ in range(288)]
+    slots = [{"energy": Decimal(0), "hr_vals": [], "step_samples": []} for _ in range(288)]
     for s in samples:
         dt = s.measured_at.astimezone(settings.tz) if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=settings.tz)
         offset = (dt - start_dt).total_seconds()
@@ -55,12 +55,19 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                 slots[idx]["energy"] += s.value
             elif s.sample_type in ("heart_rate", "resting_hr"):
                 slots[idx]["hr_vals"].append(float(s.value))
+            elif s.sample_type in ("step_count", "steps"):
+                slots[idx]["step_samples"].append(s)
 
     active_indices = []
     for i, slot in enumerate(slots):
         avg_hr = (sum(slot["hr_vals"]) / len(slot["hr_vals"])) if slot["hr_vals"] else None
-        # Exertion threshold: >= 20 kcal in 5m (~4 kcal/min) OR average HR in 5m >= 120 bpm
-        is_active = (slot["energy"] >= Decimal(20)) or (avg_hr is not None and avg_hr >= 120.0)
+        slot_steps = deduplicate_step_samples(slot["step_samples"]) if slot["step_samples"] else Decimal(0)
+        # Exertion threshold: >= 20 kcal in 5m (~4 kcal/min), avg HR >= 120 bpm, or cadence >= 250 steps/5m with avg HR >= 95 bpm
+        is_active = (
+            (slot["energy"] >= Decimal(20))
+            or (avg_hr is not None and avg_hr >= 120.0)
+            or (slot_steps >= Decimal(250) and avg_hr is not None and avg_hr >= 95.0)
+        )
         if is_active:
             active_indices.append(i)
 
@@ -90,18 +97,23 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
         avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
         peak_hr = int(round(max(all_hrs))) if all_hrs else None
 
-        # Filter noise: minimum 30 minutes AND (active energy >= 250 kcal OR avg HR >= 120)
-        if duration_mins >= 30 and (block_energy >= Decimal(250) or (avg_hr is not None and avg_hr >= 120)):
-            s_time = start_dt + timedelta(minutes=start_idx * 5)
-            e_time = start_dt + timedelta(minutes=(end_idx + 1) * 5)
-            # Centralized multi-device step deduplication for the workout window
-            cluster_steps = [
-                s for s in samples
-                if s.sample_type in ("step_count", "steps")
-                and s_time <= (s.measured_at.astimezone(settings.tz) if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=settings.tz)) < e_time
-            ]
-            block_steps = deduplicate_step_samples(cluster_steps)
+        s_time = start_dt + timedelta(minutes=start_idx * 5)
+        e_time = start_dt + timedelta(minutes=(end_idx + 1) * 5)
+        # Centralized multi-device step deduplication for the workout window
+        cluster_steps = [
+            s for s in samples
+            if s.sample_type in ("step_count", "steps")
+            and s_time <= (s.measured_at.astimezone(settings.tz) if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=settings.tz)) < e_time
+        ]
+        block_steps = deduplicate_step_samples(cluster_steps)
 
+        # Filter noise:
+        # 1. High-intensity workout: >= 30 mins AND (energy >= 250 kcal OR avg HR >= 120)
+        # 2. Sustained walking: >= 25 mins AND block_steps >= 1500 AND avg HR >= 90
+        is_high_intensity = duration_mins >= 30 and (block_energy >= Decimal(250) or (avg_hr is not None and avg_hr >= 120))
+        is_sustained_walk = duration_mins >= 25 and (block_steps >= Decimal(1500)) and (avg_hr is None or avg_hr >= 90)
+
+        if is_high_intensity or is_sustained_walk:
             conf = "high" if (avg_hr and avg_hr >= 130 and block_energy >= Decimal(350)) else "medium"
             detected.append(
                 DetectedWorkoutRead(

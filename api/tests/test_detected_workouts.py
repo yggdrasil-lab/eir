@@ -185,6 +185,64 @@ class TestDetectedWorkouts(unittest.TestCase):
         # Deduplication must prioritize Apple Watch (2,100 steps) rather than naively summing both (4,500)
         self.assertEqual(workout["step_count"], 2100)
 
+    def test_detected_workouts_walking_cadence(self):
+        target_d = dt.date(2026, 11, 9)
+        base_time = dt.datetime(2026, 11, 9, 20, 30, tzinfo=dt.timezone.utc)
+
+        # Ingest 35 minutes of brisk walk (7 x 5-minute intervals)
+        # Sub-threshold for energy (<20 kcal/5m) and HR (<120 bpm), but elevated cadence (320 steps/5m, HR 102 bpm)
+        for m in range(0, 35, 5):
+            sample_time = base_time + dt.timedelta(minutes=m)
+            end_time = sample_time + dt.timedelta(minutes=5)
+            # Low active energy: 14 kcal per 5m (total ~98 kcal, < 250 kcal)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=sample_time,
+                    ended_at=end_time,
+                    value=Decimal("14.0"),
+                    unit="kcal",
+                )
+            )
+            # Moderate HR: 102 bpm (< 120 bpm)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=sample_time,
+                    ended_at=end_time,
+                    value=Decimal("102"),
+                    unit="bpm",
+                )
+            )
+            # Cadence: 320 steps per 5 min (2,240 total)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=sample_time,
+                    ended_at=end_time,
+                    value=Decimal("320"),
+                    unit="count",
+                    extra={"device": "Raymund's Apple Watch"},
+                )
+            )
+
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data), 1)
+        workout = data[0]
+        self.assertEqual(workout["duration_minutes"], 35)
+        self.assertEqual(workout["step_count"], 2240)
+        self.assertEqual(workout["avg_hr_bpm"], 102)
+
 
 if __name__ == "__main__":
     unittest.main()
