@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     withings_client_id: str | None = None
     withings_client_secret: str | None = None
     withings_redirect_uri: str | None = None
+    kratos_api_url: str = "http://kratos-api:8000"
 
     @property
     def tz(self) -> zoneinfo.ZoneInfo:

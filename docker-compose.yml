@@ -44,6 +44,7 @@ services:
       - EIR_WITHINGS_CLIENT_ID=${EIR_WITHINGS_CLIENT_ID}
       - EIR_WITHINGS_CLIENT_SECRET=${EIR_WITHINGS_CLIENT_SECRET}
       - EIR_WITHINGS_REDIRECT_URI=${EIR_WITHINGS_REDIRECT_URI}
+      - EIR_KRATOS_API_URL=http://kratos-api:8000
       - TZ=Pacific/Auckland
     secrets:
       - eir_mcp_token

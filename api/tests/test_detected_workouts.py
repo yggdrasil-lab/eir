@@ -106,6 +106,9 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertGreaterEqual(workout["peak_hr_bpm"], 145)
         self.assertGreaterEqual(workout["step_count"], 7000)
         self.assertEqual(workout["confidence"], "high")
+        self.assertEqual(workout["classification"], "badminton")
+        self.assertEqual(workout["activity_type"], "badminton")
+        self.assertEqual(workout["routine_name"], "Badminton Match Play")
 
         # 2. Test daily summary integration
         daily_res = self.client.get(f"/biometrics/daily/{target_d.isoformat()}")
@@ -242,6 +245,129 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertEqual(workout["duration_minutes"], 35)
         self.assertEqual(workout["step_count"], 2240)
         self.assertEqual(workout["avg_hr_bpm"], 102)
+        self.assertEqual(workout["classification"], "walk")
+        self.assertEqual(workout["activity_type"], "walk")
+        self.assertEqual(workout["routine_name"], "Walk / Cardio")
+
+    def test_detected_workouts_gym_resistance(self):
+        target_d = dt.date(2026, 11, 10)
+        base_time = dt.datetime(2026, 11, 10, 16, 0, tzinfo=dt.timezone.utc)
+
+        # Ingest 45 minutes of gym session (9 x 5-minute intervals)
+        # Cyclic HR spikes: 135 bpm on working sets, 95 bpm during rest intervals
+        # Lower step count: 40 steps per 5 min (360 total steps, cadence ~8 steps/min)
+        for m in range(0, 45, 5):
+            sample_time = base_time + dt.timedelta(minutes=m)
+            end_time = sample_time + dt.timedelta(minutes=5)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=sample_time,
+                    ended_at=end_time,
+                    value=Decimal("22.0"),
+                    unit="kcal",
+                )
+            )
+            # Cyclic HR spikes: even intervals 135 bpm, odd intervals 95 bpm
+            hr_val = 135 if (m // 5) % 2 == 0 else 95
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=sample_time,
+                    ended_at=end_time,
+                    value=Decimal(str(hr_val)),
+                    unit="bpm",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=sample_time,
+                    ended_at=end_time,
+                    value=Decimal("40"),
+                    unit="count",
+                    extra={"device": "Raymund's Apple Watch"},
+                )
+            )
+
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data), 1)
+        workout = data[0]
+        self.assertEqual(workout["duration_minutes"], 45)
+        self.assertEqual(workout["classification"], "gym")
+        self.assertEqual(workout["activity_type"], "gym")
+        self.assertEqual(workout["routine_name"], "Resistance Training")
+        self.assertEqual(workout["step_count"], 360)
+
+    def test_detected_workouts_gym_with_warmup_jog(self):
+        target_d = dt.date(2026, 11, 11)
+        base_time = dt.datetime(2026, 11, 11, 17, 0, tzinfo=dt.timezone.utc)
+
+        # Ingest 40 minutes: 10 min warmup jog (2 intervals @ 300 steps/5m) + 30 min lifting (6 intervals @ 30 steps/5m)
+        for m in range(0, 40, 5):
+            sample_time = base_time + dt.timedelta(minutes=m)
+            end_time = sample_time + dt.timedelta(minutes=5)
+            is_warmup = m < 10
+            steps = Decimal("300") if is_warmup else Decimal("30")
+            hr_val = 125 if is_warmup else (130 if (m // 5) % 2 == 0 else 100)
+            energy = Decimal("25.0") if is_warmup else Decimal("18.0")
+
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=sample_time,
+                    ended_at=end_time,
+                    value=energy,
+                    unit="kcal",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=sample_time,
+                    ended_at=end_time,
+                    value=Decimal(str(hr_val)),
+                    unit="bpm",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=sample_time,
+                    ended_at=end_time,
+                    value=steps,
+                    unit="count",
+                    extra={"device": "Raymund's Apple Watch"},
+                )
+            )
+
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data), 1)
+        workout = data[0]
+        self.assertEqual(workout["duration_minutes"], 40)
+        self.assertEqual(workout["classification"], "gym")
+        self.assertEqual(workout["activity_type"], "gym")
+        self.assertEqual(workout["routine_name"], "Resistance Training")
 
 
 if __name__ == "__main__":

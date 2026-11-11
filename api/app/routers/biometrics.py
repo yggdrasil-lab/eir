@@ -18,7 +18,7 @@ from app.schemas import (
     DetectedWorkoutRead,
     HealthSampleRead,
 )
-from app.services.biometrics import deduplicate_step_samples
+from app.services.biometrics import classify_activity_pattern, deduplicate_step_samples
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
 
@@ -61,12 +61,13 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
     active_indices = []
     for i, slot in enumerate(slots):
         avg_hr = (sum(slot["hr_vals"]) / len(slot["hr_vals"])) if slot["hr_vals"] else None
-        slot_steps = deduplicate_step_samples(slot["step_samples"]) if slot["step_samples"] else Decimal(0)
-        # Exertion threshold: >= 20 kcal in 5m (~4 kcal/min), avg HR >= 120 bpm, or cadence >= 250 steps/5m with avg HR >= 95 bpm
+        slot_step_val = deduplicate_step_samples(slot["step_samples"]) if slot["step_samples"] else Decimal(0)
+        # Exertion threshold: >= 20 kcal in 5m (~4 kcal/min), avg HR >= 120 bpm, cadence >= 250 steps/5m with avg HR >= 95 bpm, or gym exertion (energy >= 15 kcal with HR >= 100 bpm)
         is_active = (
             (slot["energy"] >= Decimal(20))
             or (avg_hr is not None and avg_hr >= 120.0)
-            or (slot_steps >= Decimal(250) and avg_hr is not None and avg_hr >= 95.0)
+            or (slot_step_val >= Decimal(250) and avg_hr is not None and avg_hr >= 95.0)
+            or (slot["energy"] >= Decimal(15) and avg_hr is not None and avg_hr >= 100.0)
         )
         if is_active:
             active_indices.append(i)
@@ -91,8 +92,22 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
         duration_mins = (end_idx - start_idx + 1) * 5
         block_energy = sum((slots[i]["energy"] for i in range(start_idx, end_idx + 1)), Decimal(0))
         all_hrs: list[float] = []
+        slot_hrs: list[float | None] = []
+        slot_steps: list[Decimal] = []
         for i in range(start_idx, end_idx + 1):
             all_hrs.extend(slots[i]["hr_vals"])
+            s_hr = (
+                (sum(slots[i]["hr_vals"]) / len(slots[i]["hr_vals"]))
+                if slots[i]["hr_vals"]
+                else None
+            )
+            slot_hrs.append(s_hr)
+            s_steps = (
+                deduplicate_step_samples(slots[i]["step_samples"])
+                if slots[i]["step_samples"]
+                else Decimal(0)
+            )
+            slot_steps.append(s_steps)
 
         avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
         peak_hr = int(round(max(all_hrs))) if all_hrs else None
@@ -110,11 +125,24 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
         # Filter noise:
         # 1. High-intensity workout: >= 30 mins AND (energy >= 250 kcal OR avg HR >= 120)
         # 2. Sustained walking: >= 25 mins AND block_steps >= 1500 AND avg HR >= 90
+        # 3. Gym / Resistance: >= 30 mins AND block_energy >= 120 kcal AND (hr_spread >= 20 OR peak_hr >= 115)
+        hr_spread = (max(all_hrs) - min(all_hrs)) if all_hrs else 0
         is_high_intensity = duration_mins >= 30 and (block_energy >= Decimal(250) or (avg_hr is not None and avg_hr >= 120))
         is_sustained_walk = duration_mins >= 25 and (block_steps >= Decimal(1500)) and (avg_hr is None or avg_hr >= 90)
+        is_resistance = duration_mins >= 30 and block_energy >= Decimal(120) and (hr_spread >= 20 or (peak_hr is not None and peak_hr >= 115))
 
-        if is_high_intensity or is_sustained_walk:
+        if is_high_intensity or is_sustained_walk or is_resistance:
             conf = "high" if (avg_hr and avg_hr >= 130 and block_energy >= Decimal(350)) else "medium"
+            pattern = classify_activity_pattern(
+                duration_mins=duration_mins,
+                block_energy=block_energy,
+                avg_hr=avg_hr,
+                peak_hr=peak_hr,
+                all_hrs=all_hrs,
+                block_steps=block_steps,
+                slot_steps=slot_steps,
+                slot_hrs=slot_hrs,
+            )
             detected.append(
                 DetectedWorkoutRead(
                     started_at=s_time,
@@ -125,6 +153,9 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                     peak_hr_bpm=peak_hr,
                     step_count=int(round(block_steps)) if block_steps > 0 else None,
                     confidence=conf,
+                    classification=pattern["classification"],
+                    activity_type=pattern["activity_type"],
+                    routine_name=pattern["routine_name"],
                 )
             )
 
