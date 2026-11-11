@@ -19,11 +19,14 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import get_db
 from app.models import BiometricMeasurement, HealthSample, OAuthToken
+from app.routers.biometrics import detect_workouts_for_day
 from app.services.biometrics import deduplicate_step_samples
+from app.services.kratos_sync import sync_detected_workouts_to_kratos
 from app.schemas import (
     AppleHealthComprehensiveSyncPayload,
     AppleHealthSyncResponse,
     BiometricRead,
+    DetectedWorkoutRead,
     WithingsAuthStatusResponse,
     WithingsMeasurementPayload,
 )
@@ -366,11 +369,22 @@ def sync_apple_health_comprehensive(
 
     db.commit()
 
+    # Run workout detection for affected dates after daily rollups
+    detected_workouts: list[DetectedWorkoutRead] = []
+    for d in days:
+        day_workouts = detect_workouts_for_day(db, d)
+        detected_workouts.extend(day_workouts)
+
+    # Automatically sync detected and classified workouts to Kratos idempotently
+    if detected_workouts:
+        sync_detected_workouts_to_kratos(detected_workouts)
+
     return AppleHealthSyncResponse(
         status="ok",
         total_samples_ingested=len(items),
         metrics_summary=metrics_counts,
         days_processed=days,
+        detected_workouts=detected_workouts,
     )
 
 

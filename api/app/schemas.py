@@ -196,6 +196,9 @@ class DetectedWorkoutRead(BaseModel):
     peak_hr_bpm: int | None = None
     step_count: int | None = None
     confidence: str = "medium"  # 'high', 'medium'
+    activity_type: str | None = None
+    classification: str | None = None
+    routine_name: str | None = None
 
 
 class DailyBiometricSummary(BaseModel):
@@ -540,3 +543,4 @@ class AppleHealthSyncResponse(BaseModel):
     total_samples_ingested: int
     metrics_summary: dict[str, int] = Field(default_factory=dict)
     days_processed: list[date] = Field(default_factory=list)
+    detected_workouts: list[DetectedWorkoutRead] = Field(default_factory=list)
