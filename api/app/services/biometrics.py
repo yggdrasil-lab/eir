@@ -106,9 +106,12 @@ def classify_activity_pattern(
         hr_range = float(peak_hr - avg_hr)
 
     # Check warmup jog segment: first 1 or 2 slots (5-10 min) have elevated cadence (>= 50 steps/min),
-    # followed by lower cadence (< 35 steps/min) for the remainder.
+    # followed by lower cadence (< 35 steps/min) for the remainder WITHOUT repeated high-cadence bursts.
     has_warmup_jog = False
     if len(slot_steps) >= 3:
+        has_post_warmup_bursts_2 = any(s >= Decimal(250) for s in slot_steps[2:])
+        has_post_warmup_bursts_1 = any(s >= Decimal(250) for s in slot_steps[1:])
+
         # 2-slot warmup (10 mins)
         warmup_slots_2 = slot_steps[:2]
         post_warmup_slots_2 = slot_steps[2:]
@@ -127,10 +130,13 @@ def classify_activity_pattern(
         post_cadence_1 = (
             float(sum(post_warmup_slots_1)) / (len(post_warmup_slots_1) * 5) if post_warmup_slots_1 else 0.0
         )
-        if (warmup_cadence_2 >= 50.0 and post_cadence_2 < 35.0) or (
-            warmup_cadence_1 >= 50.0 and post_cadence_1 < 35.0
+        if (warmup_cadence_2 >= 50.0 and post_cadence_2 < 35.0 and not has_post_warmup_bursts_2) or (
+            warmup_cadence_1 >= 50.0 and post_cadence_1 < 35.0 and not has_post_warmup_bursts_1
         ):
             has_warmup_jog = True
+
+    # Count court burst slots (slots with >= 250 steps, meaning >= 50 steps/min of active movement)
+    burst_slots = sum(1 for s in slot_steps if s >= Decimal(250))
 
     # 1. Swimming / Aquatic:
     # - very low overall cadence (< 20 steps/min) and no warmup jog
@@ -176,25 +182,33 @@ def classify_activity_pattern(
         and not has_rest_break_interval
     )
 
-    # 3. Gym / Resistance:
-    # - cyclic HR spikes alternating with rest intervals
-    # - lower step count (< 50 steps/min) or warmup jog segment followed by resistance sets
-    # - warmup jog segment explicitly classifies as gym
-    is_gym = (
-        not is_swim
-        and (cadence < 50.0 or has_warmup_jog)
-        and (hr_range >= 20.0 or has_warmup_jog or cadence < 30.0)
-    )
-
-    # 4. Badminton / Court Sports:
+    # 3. Badminton / Court Sports:
     # - elevated HR (Zone 3-5, avg_hr >= 125 or peak_hr >= 140)
-    # - sustained active court movement (cadence >= 40 steps/min)
-    # - excludes gym workouts with warmup jog or low-cadence resistance lifting
+    # - sustained active court movement:
+    #   * cadence >= 40 steps/min, OR
+    #   * cadence >= 28 steps/min with burst slots (>= 2 slots with >= 250 steps), OR
+    #   * cadence >= 32 steps/min with rest break intervals (game-rest-game pattern)
+    # - excludes gym workouts with warmup jog and swimming
     is_badminton = (
         not has_warmup_jog
         and not is_swim
-        and (cadence >= 40.0 or (cadence >= 35.0 and has_rest_break_interval))
+        and (
+            cadence >= 40.0
+            or (cadence >= 28.0 and burst_slots >= 2)
+            or (cadence >= 32.0 and has_rest_break_interval)
+        )
         and ((avg_hr is not None and avg_hr >= 125) or (peak_hr is not None and peak_hr >= 140))
+    )
+
+    # 4. Gym / Resistance:
+    # - cyclic HR spikes alternating with rest intervals
+    # - lower step count (< 50 steps/min) or warmup jog segment followed by resistance sets
+    # - excludes court sports (badminton) and swimming
+    is_gym = (
+        not is_swim
+        and not is_badminton
+        and (cadence < 50.0 or has_warmup_jog)
+        and (hr_range >= 20.0 or has_warmup_jog or cadence < 30.0)
     )
 
     if is_swim:
@@ -209,17 +223,17 @@ def classify_activity_pattern(
             "activity_type": "walk",
             "routine_name": "Walk / Cardio",
         }
-    elif is_gym:
-        return {
-            "classification": "gym",
-            "activity_type": "gym",
-            "routine_name": "Resistance Training",
-        }
     elif is_badminton:
         return {
             "classification": "badminton",
             "activity_type": "badminton",
             "routine_name": "Badminton Match Play",
+        }
+    elif is_gym:
+        return {
+            "classification": "gym",
+            "activity_type": "gym",
+            "routine_name": "Resistance Training",
         }
     else:
         if cadence > 50.0:

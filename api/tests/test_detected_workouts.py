@@ -723,6 +723,64 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertEqual(workout["classification"], "swim")
         self.assertEqual(workout["routine_name"], "Swimming")
 
+    def test_detected_workouts_badminton_intermittent_games_not_gym(self):
+        target_d = dt.date(2026, 11, 16)
+        base_time = dt.datetime(2026, 11, 16, 19, 0, tzinfo=dt.timezone.utc)
+
+        # 65 minutes total (13 intervals): games (400 steps) alternating with court bench rest (0 steps)
+        # High sustained HR (avg 157 bpm, peak 176 bpm), overall cadence ~35 steps/min
+        slot_pattern_steps = [350, 0, 450, 0, 30, 420, 0, 400, 0, 400, 0, 180, 15]
+        slot_pattern_hrs = [100, 125, 115, 120, 145, 170, 165, 162, 160, 172, 155, 130, 130]
+
+        for i, (steps, hr_val) in enumerate(zip(slot_pattern_steps, slot_pattern_hrs)):
+            t = base_time + dt.timedelta(minutes=i * 5)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal("15.0") if steps > 100 else Decimal("2.0"),
+                    unit="kcal",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal(str(hr_val)),
+                    unit="bpm",
+                )
+            )
+            if steps > 0:
+                self.db.add(
+                    HealthSample(
+                        id=uuid.uuid4(),
+                        source="apple_health",
+                        sample_type="step_count",
+                        measured_at=t,
+                        ended_at=t + dt.timedelta(minutes=5),
+                        value=Decimal(str(steps)),
+                        unit="count",
+                    )
+                )
+
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data), 1)
+        workout = data[0]
+        self.assertEqual(workout["duration_minutes"], 65)
+        self.assertEqual(workout["classification"], "badminton")
+        self.assertEqual(workout["activity_type"], "badminton")
+        self.assertEqual(workout["routine_name"], "Badminton Match Play")
+
 
 if __name__ == "__main__":
     unittest.main()
