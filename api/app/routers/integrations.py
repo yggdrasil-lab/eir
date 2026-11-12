@@ -266,13 +266,12 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
         )
     )
 
-    # 12. Cardio fitness / VO2 max (latest score for date)
+    # 12. Cardio fitness / VO2 max (latest known score on or before target date)
     vo2max = db.scalar(
         select(HealthSample.value)
         .where(
             HealthSample.deleted_at.is_(None),
             HealthSample.sample_type.in_(["vo2_max", "cardio_fitness", "vo2max"]),
-            HealthSample.measured_at >= start_dt,
             HealthSample.measured_at <= end_dt,
         )
         .order_by(HealthSample.measured_at.desc())
