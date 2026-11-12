@@ -75,11 +75,29 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
     if not active_indices:
         return []
 
-    # Merge clusters with max gap of 3 slots (15 minutes) to bridge rest/water intervals
+    # Merge clusters with max gap of 3 slots (15 minutes) to bridge short rest/water intervals.
+    # Rest Gap Splitting: Ensure stationary intervals (>= 10 min with < 50 steps/5min)
+    # split sessions into separate blocks instead of bridging across rest gaps.
     clusters: list[tuple[int, int]] = []
     curr = [active_indices[0]]
     for idx in active_indices[1:]:
-        if idx - curr[-1] <= 3:
+        gap_has_stationary_rest = False
+        consecutive_stationary = 0
+        for g_idx in range(curr[-1] + 1, idx):
+            g_steps = (
+                deduplicate_step_samples(slots[g_idx]["step_samples"])
+                if slots[g_idx]["step_samples"]
+                else Decimal(0)
+            )
+            if g_steps < Decimal(50):
+                consecutive_stationary += 1
+                if consecutive_stationary >= 2:  # 2 slots * 5 min = 10 min
+                    gap_has_stationary_rest = True
+                    break
+            else:
+                consecutive_stationary = 0
+
+        if (idx - curr[-1] <= 3) and not gap_has_stationary_rest:
             curr.append(idx)
         else:
             clusters.append((curr[0], curr[-1]))

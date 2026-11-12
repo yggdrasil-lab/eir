@@ -107,15 +107,27 @@ def classify_activity_pattern(
     # followed by lower cadence (< 35 steps/min) for the remainder.
     has_warmup_jog = False
     if len(slot_steps) >= 3:
-        warmup_slots = slot_steps[:2]
-        post_warmup_slots = slot_steps[2:]
-        warmup_cadence = (
-            float(sum(warmup_slots)) / (len(warmup_slots) * 5) if warmup_slots else 0.0
+        # 2-slot warmup (10 mins)
+        warmup_slots_2 = slot_steps[:2]
+        post_warmup_slots_2 = slot_steps[2:]
+        warmup_cadence_2 = (
+            float(sum(warmup_slots_2)) / (len(warmup_slots_2) * 5) if warmup_slots_2 else 0.0
         )
-        post_cadence = (
-            float(sum(post_warmup_slots)) / (len(post_warmup_slots) * 5) if post_warmup_slots else 0.0
+        post_cadence_2 = (
+            float(sum(post_warmup_slots_2)) / (len(post_warmup_slots_2) * 5) if post_warmup_slots_2 else 0.0
         )
-        if warmup_cadence >= 50.0 and post_cadence < 35.0:
+        # 1-slot warmup (5 mins)
+        warmup_slots_1 = slot_steps[:1]
+        post_warmup_slots_1 = slot_steps[1:]
+        warmup_cadence_1 = (
+            float(sum(warmup_slots_1)) / (len(warmup_slots_1) * 5) if warmup_slots_1 else 0.0
+        )
+        post_cadence_1 = (
+            float(sum(post_warmup_slots_1)) / (len(post_warmup_slots_1) * 5) if post_warmup_slots_1 else 0.0
+        )
+        if (warmup_cadence_2 >= 50.0 and post_cadence_2 < 35.0) or (
+            warmup_cadence_1 >= 50.0 and post_cadence_1 < 35.0
+        ):
             has_warmup_jog = True
 
     # 1. Walk:
@@ -130,20 +142,22 @@ def classify_activity_pattern(
         and not has_rest_break_interval
     )
 
-    # 2. Badminton / Court Sports:
-    # - elevated HR (Zone 3-5, avg_hr >= 125 or peak_hr >= 140)
-    # - bursty steps
-    # - rest break intervals (>=10 min stationary gap) OR active court sport intensity
-    is_badminton = (
-        (avg_hr is not None and avg_hr >= 125) or (peak_hr is not None and peak_hr >= 140)
-    ) and (cadence >= 30.0 or has_rest_break_interval)
-
-    # 3. Gym / Resistance:
+    # 2. Gym / Resistance:
     # - cyclic HR spikes alternating with rest intervals
-    # - lower step count (< 50 steps/min)
-    # - optional warmup jog segment
+    # - lower step count (< 50 steps/min) or warmup jog segment followed by resistance sets
+    # - warmup jog segment explicitly classifies as gym
     is_gym = (cadence < 50.0 or has_warmup_jog) and (
         hr_range >= 20.0 or has_warmup_jog or cadence < 30.0
+    )
+
+    # 3. Badminton / Court Sports:
+    # - elevated HR (Zone 3-5, avg_hr >= 125 or peak_hr >= 140)
+    # - sustained active court movement (cadence >= 40 steps/min)
+    # - excludes gym workouts with warmup jog or low-cadence resistance lifting
+    is_badminton = (
+        not has_warmup_jog
+        and (cadence >= 40.0 or (cadence >= 35.0 and has_rest_break_interval))
+        and ((avg_hr is not None and avg_hr >= 125) or (peak_hr is not None and peak_hr >= 140))
     )
 
     if is_walk:
@@ -152,17 +166,17 @@ def classify_activity_pattern(
             "activity_type": "walk",
             "routine_name": "Walk / Cardio",
         }
-    elif is_badminton:
-        return {
-            "classification": "badminton",
-            "activity_type": "badminton",
-            "routine_name": "Badminton Match Play",
-        }
     elif is_gym:
         return {
             "classification": "gym",
             "activity_type": "gym",
             "routine_name": "Resistance Training",
+        }
+    elif is_badminton:
+        return {
+            "classification": "badminton",
+            "activity_type": "badminton",
+            "routine_name": "Badminton Match Play",
         }
     else:
         if cadence > 50.0:

@@ -119,20 +119,113 @@ class TestKratosSync(unittest.TestCase):
         )
 
         mock_http = MagicMock(spec=httpx.Client)
-        # GET /sessions/{id} returns 200 with confirmed session
+        # GET /sessions/{id} returns 200 with confirmed and already reconciled session
         mock_check = MagicMock()
         mock_check.status_code = 200
         mock_check.json.return_value = {
             "id": str(generate_session_id(w.started_at.isoformat(), w.ended_at.isoformat())),
-            "extra": {"confirmed": True, "inferred": False},
+            "extra": {"confirmed": True, "inferred": False, "telemetry_reconciled": True},
         }
         mock_http.get.return_value = mock_check
 
         results = sync_detected_workouts_to_kratos([w], kratos_url="http://kratos-api:8000", client=mock_http)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["status"], "skipped_confirmed")
-        # PUT should never be called when session is already confirmed
+        # PUT should never be called when session is already confirmed and reconciled
         self.assertEqual(mock_http.put.call_count, 0)
+
+    def test_sync_detected_workouts_reconciles_confirmed_session(self):
+        w = DetectedWorkoutRead(
+            started_at=datetime(2026, 11, 11, 9, 0, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 11, 11, 10, 0, tzinfo=timezone.utc),
+            duration_minutes=60,
+            active_energy_kcal=450,
+            avg_hr_bpm=142,
+            peak_hr_bpm=155,
+            step_count=5200,
+            confidence="high",
+            classification="badminton",
+            activity_type="badminton",
+            routine_name="Badminton Match Play",
+        )
+
+        mock_http = MagicMock(spec=httpx.Client)
+        mock_check = MagicMock()
+        mock_check.status_code = 200
+        mock_check.json.return_value = {
+            "id": str(generate_session_id(w.started_at.isoformat(), w.ended_at.isoformat())),
+            "extra": {"confirmed": True, "inferred": False},
+            "notes": "User logged session",
+            "items": [{"id": str(uuid.uuid4()), "sets": []}],
+        }
+        mock_http.get.return_value = mock_check
+
+        mock_put = MagicMock()
+        mock_put.status_code = 200
+        mock_http.put.return_value = mock_put
+
+        results = sync_detected_workouts_to_kratos([w], kratos_url="http://kratos-api:8000", client=mock_http)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "reconciled")
+        self.assertEqual(mock_http.put.call_count, 1)
+        put_kwargs = mock_http.put.call_args[1]["json"]
+        self.assertEqual(put_kwargs["extra"]["active_energy_kcal"], 450)
+        self.assertEqual(put_kwargs["extra"]["avg_hr"], 142)
+        self.assertTrue(put_kwargs["extra"]["telemetry_reconciled"])
+        self.assertEqual(len(put_kwargs["items"]), 1)
+
+    def test_sync_detected_workouts_overlap_guard_deduplication(self):
+        w = DetectedWorkoutRead(
+            started_at=datetime(2026, 11, 11, 9, 0, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 11, 11, 10, 0, tzinfo=timezone.utc),
+            duration_minutes=60,
+            active_energy_kcal=500,
+            avg_hr_bpm=135,
+            peak_hr_bpm=150,
+            step_count=2000,
+            confidence="high",
+            classification="gym",
+            activity_type="gym",
+            routine_name="Resistance Training",
+        )
+
+        existing_session_id = str(uuid.uuid4())
+        mock_http = MagicMock(spec=httpx.Client)
+
+        def mock_get(url, **kwargs):
+            resp = MagicMock()
+            if url.endswith("/sessions"):
+                resp.status_code = 200
+                resp.json.return_value = [{
+                    "id": existing_session_id,
+                    "started_at": "2026-11-11T08:50:00+00:00",
+                    "ended_at": "2026-11-11T10:05:00+00:00",
+                    "notes": "Chest day",
+                    "routine_id": str(uuid.uuid4()),
+                    "extra": {"confirmed": True, "inferred": False},
+                    "items": [{"exercise_id": str(uuid.uuid4())}],
+                }]
+            else:
+                resp.status_code = 404
+            return resp
+
+        mock_http.get.side_effect = mock_get
+        mock_put = MagicMock()
+        mock_put.status_code = 200
+        mock_http.put.return_value = mock_put
+
+        results = sync_detected_workouts_to_kratos([w], kratos_url="http://kratos-api:8000", client=mock_http)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["session_id"], existing_session_id)
+        self.assertEqual(results[0]["status"], "reconciled")
+        # Verified PUT target was the existing overlapping session, preventing duplicate suggestion
+        self.assertEqual(mock_http.put.call_count, 1)
+        put_url = mock_http.put.call_args[0][0]
+        self.assertTrue(put_url.endswith(f"/sessions/{existing_session_id}"))
+        put_body = mock_http.put.call_args[1]["json"]
+        self.assertEqual(put_body["extra"]["active_energy_kcal"], 500)
+        self.assertEqual(put_body["extra"]["step_count"], 2000)
+        self.assertTrue(put_body["extra"]["telemetry_reconciled"])
 
     def test_apple_health_ingest_runs_detection_and_sync(self):
         target_date = date(2026, 11, 11)
