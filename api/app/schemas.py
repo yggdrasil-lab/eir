@@ -216,7 +216,13 @@ class DailyBiometricSummary(BaseModel):
     hrv_ms: Decimal | None = None
     sleep_duration_hours: float | None = None
     sleep_deep_hours: float | None = None
+    sleep_rem_hours: float | None = None
     sleep_score: int | None = None
+    wrist_temperature_c: float | None = None
+    respiratory_rate_bpm: float | None = None
+    oxygen_saturation_pct: float | None = None
+    walking_asymmetry_pct: float | None = None
+    vo2_max: float | None = None
     step_count: int | None = None
     active_energy_kcal: int | None = None
     readiness_notes: list[str] = Field(default_factory=list)
@@ -312,6 +318,8 @@ DEFAULT_METRIC_UNITS: dict[str, str] = {
     "oxygen_saturation": "%",
     "body_temperature": "C",
     "wrist_temperature": "C",
+    "respiratory_rate": "breaths/min",
+    "walking_asymmetry": "%",
 }
 
 METRIC_ALIASES: dict[str, str] = {
@@ -336,6 +344,20 @@ METRIC_ALIASES: dict[str, str] = {
     "active_energy_kcal": "active_energy",
     "energy": "active_energy",
     "distance_meters": "distance",
+    "walking_asymmetry": "walking_asymmetry",
+    "walking_ asymmetry": "walking_asymmetry",
+    "walking asymmetry": "walking_asymmetry",
+    "walking_asymmetry_percentage": "walking_asymmetry",
+    "asymmetry": "walking_asymmetry",
+    "sleeping_respiratory_rate": "respiratory_rate",
+    "respiratory_rate_bpm": "respiratory_rate",
+    "respiration_rate": "respiratory_rate",
+    "wrist_temp": "wrist_temperature",
+    "wrist_temperature_c": "wrist_temperature",
+    "spo2": "oxygen_saturation",
+    "blood_oxygen": "oxygen_saturation",
+    "cardio_fitness": "vo2_max",
+    "vo2max": "vo2_max",
 }
 
 

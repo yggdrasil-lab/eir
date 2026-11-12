@@ -221,6 +221,64 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
 
     steps = deduplicate_step_samples(step_samples) if step_samples else None
 
+    # 8. Wrist temperature (average nightly baseline)
+    wrist_temp = db.scalar(
+        select(func.avg(HealthSample.value)).where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["wrist_temperature", "wrist_temp", "wrist_temperature_c"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+    )
+
+    # 9. Sleeping respiratory rate (average breaths/min)
+    resp_rate = db.scalar(
+        select(func.avg(HealthSample.value)).where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["respiratory_rate", "sleeping_respiratory_rate", "respiratory_rate_bpm"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+    )
+
+    # 10. Blood oxygen saturation (SpO2 average %)
+    spo2 = db.scalar(
+        select(func.avg(HealthSample.value)).where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["oxygen_saturation", "spo2", "blood_oxygen"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+    )
+
+    # 11. Walking asymmetry (average %)
+    asymmetry = db.scalar(
+        select(func.avg(HealthSample.value)).where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_([
+                "walking_asymmetry",
+                "walking_ asymmetry",
+                "walking asymmetry",
+                "walking_asymmetry_percentage",
+            ]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+    )
+
+    # 12. Cardio fitness / VO2 max (latest score for date)
+    vo2max = db.scalar(
+        select(HealthSample.value)
+        .where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type.in_(["vo2_max", "cardio_fitness", "vo2max"]),
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+        .order_by(HealthSample.measured_at.desc())
+        .limit(1)
+    )
+
     # Find or create daily biometric_measurement (unified across all sources for this date)
     measurement = db.scalar(
         select(BiometricMeasurement).where(
@@ -263,6 +321,19 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
         measurement.active_energy_kcal = int(round(energy_kcal))
     if steps is not None:
         measurement.step_count = int(round(steps))
+
+    cur_extra = dict(measurement.extra or {})
+    if wrist_temp is not None:
+        cur_extra["wrist_temperature_c"] = round(float(wrist_temp), 2)
+    if resp_rate is not None:
+        cur_extra["respiratory_rate_bpm"] = round(float(resp_rate), 1)
+    if spo2 is not None:
+        cur_extra["oxygen_saturation_pct"] = round(float(spo2), 1)
+    if asymmetry is not None:
+        cur_extra["walking_asymmetry_pct"] = round(float(asymmetry), 2)
+    if vo2max is not None:
+        cur_extra["vo2_max"] = round(float(vo2max), 1)
+    measurement.extra = cur_extra
 
     return measurement
 
