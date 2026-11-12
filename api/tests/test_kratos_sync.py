@@ -74,6 +74,11 @@ class TestKratosSync(unittest.TestCase):
             classification="badminton",
             activity_type="badminton",
             routine_name="Badminton Match Play",
+            effort_rating="hard",
+            rpe=8.5,
+            trimp=220.0,
+            hr_zones={"z4_threshold_pct": 35.0},
+            hr_recovery_60s=25,
         )
 
         mock_http = MagicMock(spec=httpx.Client)
@@ -102,6 +107,10 @@ class TestKratosSync(unittest.TestCase):
         self.assertTrue(payload["extra"]["inferred"])
         self.assertEqual(payload["extra"]["classification"], "badminton")
         self.assertEqual(payload["extra"]["active_energy_kcal"], 450)
+        self.assertEqual(payload["extra"]["effort_rating"], "hard")
+        self.assertEqual(payload["extra"]["rpe"], 8.5)
+        self.assertEqual(payload["extra"]["trimp"], 220.0)
+        self.assertEqual(payload["extra"]["hr_recovery_60s"], 25)
 
     def test_sync_detected_workouts_skips_confirmed_session(self):
         w = DetectedWorkoutRead(
@@ -116,6 +125,11 @@ class TestKratosSync(unittest.TestCase):
             classification="badminton",
             activity_type="badminton",
             routine_name="Badminton Match Play",
+            effort_rating="hard",
+            rpe=8.5,
+            trimp=220.0,
+            hr_zones={"z4_threshold_pct": 35.0},
+            hr_recovery_60s=25,
         )
 
         mock_http = MagicMock(spec=httpx.Client)
@@ -147,6 +161,11 @@ class TestKratosSync(unittest.TestCase):
             classification="badminton",
             activity_type="badminton",
             routine_name="Badminton Match Play",
+            effort_rating="hard",
+            rpe=8.5,
+            trimp=220.0,
+            hr_zones={"z4_threshold_pct": 35.0},
+            hr_recovery_60s=25,
         )
 
         mock_http = MagicMock(spec=httpx.Client)
@@ -171,6 +190,10 @@ class TestKratosSync(unittest.TestCase):
         put_kwargs = mock_http.put.call_args[1]["json"]
         self.assertEqual(put_kwargs["extra"]["active_energy_kcal"], 450)
         self.assertEqual(put_kwargs["extra"]["avg_hr"], 142)
+        self.assertEqual(put_kwargs["extra"]["effort_rating"], "hard")
+        self.assertEqual(put_kwargs["extra"]["rpe"], 8.5)
+        self.assertEqual(put_kwargs["extra"]["trimp"], 220.0)
+        self.assertEqual(put_kwargs["extra"]["hr_recovery_60s"], 25)
         self.assertTrue(put_kwargs["extra"]["telemetry_reconciled"])
         self.assertEqual(len(put_kwargs["items"]), 1)
 

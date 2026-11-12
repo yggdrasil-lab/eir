@@ -147,6 +147,16 @@ def sync_detected_workouts_to_kratos(
                     existing_extra["peak_hr"] = w.peak_hr_bpm
                 if w.step_count is not None:
                     existing_extra["step_count"] = w.step_count
+                if w.effort_rating:
+                    existing_extra["effort_rating"] = w.effort_rating
+                if w.rpe is not None:
+                    existing_extra["rpe"] = w.rpe
+                if w.trimp is not None:
+                    existing_extra["trimp"] = w.trimp
+                if w.hr_zones:
+                    existing_extra["hr_zones"] = w.hr_zones
+                if w.hr_recovery_60s is not None:
+                    existing_extra["hr_recovery_60s"] = w.hr_recovery_60s
                 existing_extra["telemetry_source"] = "apple_health_detected"
                 existing_extra["telemetry_reconciled"] = True
                 if not is_confirmed:
@@ -202,6 +212,11 @@ def sync_detected_workouts_to_kratos(
                 "avg_hr": w.avg_hr_bpm,
                 "peak_hr": w.peak_hr_bpm,
                 "step_count": w.step_count,
+                "effort_rating": w.effort_rating,
+                "rpe": w.rpe,
+                "trimp": w.trimp,
+                "hr_zones": w.hr_zones,
+                "hr_recovery_60s": w.hr_recovery_60s,
                 "confidence": w.confidence,
                 "telemetry_source": "apple_health_detected",
                 "telemetry_reconciled": True,
