@@ -22,6 +22,7 @@ from app.services.biometrics import (
     classify_activity_pattern,
     compute_workout_exertion_metrics,
     deduplicate_step_samples,
+    estimate_workout_active_calories,
 )
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
@@ -188,10 +189,38 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                 slot_hrs=slot_hrs,
                 slot_energies=slot_energies,
             )
+            final_energy_kcal = int(round(block_energy))
+            energy_rate = float(block_energy) / duration_mins if duration_mins > 0 else 0.0
+            # Calorie undercounting fallback: when avg_hr indicates sustained exertion (>= 115 bpm)
+            # but raw energy burn rate is suspiciously low (< 3.5 kcal/min), Apple Watch was in
+            # passive background mode rather than active workout mode. Fall back to physiological MET estimate.
+            if (avg_hr is not None and avg_hr >= 115) and energy_rate < 3.5:
+                latest_weight = (
+                    db.scalar(
+                        select(HealthSample.value)
+                        .where(
+                            HealthSample.deleted_at.is_(None),
+                            HealthSample.sample_type.in_(["weight", "weight_kg"]),
+                            HealthSample.measured_at <= end_dt,
+                        )
+                        .order_by(HealthSample.measured_at.desc())
+                        .limit(1)
+                    )
+                    or 85.0
+                )
+                estimated_energy = estimate_workout_active_calories(
+                    duration_mins=duration_mins,
+                    avg_hr=avg_hr,
+                    classification=pattern["classification"],
+                    weight_kg=float(latest_weight),
+                )
+                if estimated_energy > final_energy_kcal:
+                    final_energy_kcal = estimated_energy
+
             exertion = compute_workout_exertion_metrics(
                 all_hrs=all_hrs,
                 duration_mins=duration_mins,
-                block_energy=block_energy,
+                block_energy=Decimal(final_energy_kcal),
             )
 
             # Post-workout heart rate recovery (drop 60-90s post-exercise)
@@ -220,7 +249,7 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                     started_at=s_time,
                     ended_at=e_time,
                     duration_minutes=duration_mins,
-                    active_energy_kcal=int(round(block_energy)),
+                    active_energy_kcal=final_energy_kcal,
                     avg_hr_bpm=avg_hr,
                     peak_hr_bpm=peak_hr,
                     step_count=int(round(block_steps)) if block_steps > 0 else None,
@@ -464,6 +493,10 @@ def get_daily_summary(
 
     summary.readiness_notes = readiness_notes
     summary.detected_workouts = detect_workouts_for_day(db, target_date)
+    if summary.detected_workouts:
+        detected_energy_total = sum(w.active_energy_kcal for w in summary.detected_workouts)
+        if summary.active_energy_kcal is None or detected_energy_total > summary.active_energy_kcal:
+            summary.active_energy_kcal = detected_energy_total
     return summary
 
 

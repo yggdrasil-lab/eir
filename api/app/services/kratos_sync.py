@@ -126,8 +126,14 @@ def sync_detected_workouts_to_kratos(
                     or len(matched_session.get("items") or []) > 0
                 )
 
-                # If already reconciled and confirmed, skip to avoid redundant writes
-                if is_confirmed and existing_extra.get("telemetry_reconciled") is True:
+                # If already reconciled and confirmed with complete exertion telemetry, skip redundant writes
+                if (
+                    is_confirmed
+                    and existing_extra.get("telemetry_reconciled") is True
+                    and "hr_zones" in existing_extra
+                    and "rpe" in existing_extra
+                    and (existing_extra.get("active_energy_kcal") or 0) >= w.active_energy_kcal
+                ):
                     logger.info(
                         "Skipping Kratos session %s: already confirmed and telemetry reconciled",
                         target_id,
