@@ -417,12 +417,12 @@ def get_daily_summary(
             summary.walking_asymmetry_pct = round(float(wa), 2)
 
     if summary.vo2_max is None:
+        # Fall back to latest known VO2 max measurement on or before target date
         vm = db.scalar(
             select(HealthSample.value)
             .where(
                 HealthSample.deleted_at.is_(None),
                 HealthSample.sample_type.in_(["vo2_max", "cardio_fitness", "vo2max"]),
-                HealthSample.measured_at >= start_dt,
                 HealthSample.measured_at <= end_dt,
             )
             .order_by(HealthSample.measured_at.desc())
