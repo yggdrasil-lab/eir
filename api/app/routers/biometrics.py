@@ -313,12 +313,25 @@ def get_daily_summary(
             summary.sleep_duration_hours = round(r.sleep_duration_s / 3600.0, 2)
         if r.sleep_deep_s is not None:
             summary.sleep_deep_hours = round(r.sleep_deep_s / 3600.0, 2)
+        if r.sleep_rem_s is not None:
+            summary.sleep_rem_hours = round(r.sleep_rem_s / 3600.0, 2)
         if r.sleep_score is not None:
             summary.sleep_score = r.sleep_score
         if r.step_count is not None:
             summary.step_count = (summary.step_count or 0) + r.step_count
         if r.active_energy_kcal is not None:
             summary.active_energy_kcal = (summary.active_energy_kcal or 0) + r.active_energy_kcal
+        if r.extra:
+            if "wrist_temperature_c" in r.extra:
+                summary.wrist_temperature_c = r.extra["wrist_temperature_c"]
+            if "respiratory_rate_bpm" in r.extra:
+                summary.respiratory_rate_bpm = r.extra["respiratory_rate_bpm"]
+            if "oxygen_saturation_pct" in r.extra:
+                summary.oxygen_saturation_pct = r.extra["oxygen_saturation_pct"]
+            if "walking_asymmetry_pct" in r.extra:
+                summary.walking_asymmetry_pct = r.extra["walking_asymmetry_pct"]
+            if "vo2_max" in r.extra:
+                summary.vo2_max = r.extra["vo2_max"]
         if r.notes:
             readiness_notes.append(r.notes)
 
@@ -348,6 +361,93 @@ def get_daily_summary(
         )
         if raw_steps:
             summary.step_count = int(round(deduplicate_step_samples(raw_steps)))
+
+    # Granular sample aggregations for new health metrics if missing
+    if summary.wrist_temperature_c is None:
+        wt = db.scalar(
+            select(func.avg(HealthSample.value)).where(
+                HealthSample.deleted_at.is_(None),
+                HealthSample.sample_type.in_(["wrist_temperature", "wrist_temp", "wrist_temperature_c"]),
+                HealthSample.measured_at >= start_dt,
+                HealthSample.measured_at <= end_dt,
+            )
+        )
+        if wt is not None:
+            summary.wrist_temperature_c = round(float(wt), 2)
+
+    if summary.respiratory_rate_bpm is None:
+        rr = db.scalar(
+            select(func.avg(HealthSample.value)).where(
+                HealthSample.deleted_at.is_(None),
+                HealthSample.sample_type.in_(["respiratory_rate", "sleeping_respiratory_rate", "respiratory_rate_bpm"]),
+                HealthSample.measured_at >= start_dt,
+                HealthSample.measured_at <= end_dt,
+            )
+        )
+        if rr is not None:
+            summary.respiratory_rate_bpm = round(float(rr), 1)
+
+    if summary.oxygen_saturation_pct is None:
+        ox = db.scalar(
+            select(func.avg(HealthSample.value)).where(
+                HealthSample.deleted_at.is_(None),
+                HealthSample.sample_type.in_(["oxygen_saturation", "spo2", "blood_oxygen"]),
+                HealthSample.measured_at >= start_dt,
+                HealthSample.measured_at <= end_dt,
+            )
+        )
+        if ox is not None:
+            summary.oxygen_saturation_pct = round(float(ox), 1)
+
+    if summary.walking_asymmetry_pct is None:
+        wa = db.scalar(
+            select(func.avg(HealthSample.value)).where(
+                HealthSample.deleted_at.is_(None),
+                HealthSample.sample_type.in_([
+                    "walking_asymmetry",
+                    "walking_ asymmetry",
+                    "walking asymmetry",
+                    "walking_asymmetry_percentage",
+                ]),
+                HealthSample.measured_at >= start_dt,
+                HealthSample.measured_at <= end_dt,
+            )
+        )
+        if wa is not None:
+            summary.walking_asymmetry_pct = round(float(wa), 2)
+
+    if summary.vo2_max is None:
+        vm = db.scalar(
+            select(HealthSample.value)
+            .where(
+                HealthSample.deleted_at.is_(None),
+                HealthSample.sample_type.in_(["vo2_max", "cardio_fitness", "vo2max"]),
+                HealthSample.measured_at >= start_dt,
+                HealthSample.measured_at <= end_dt,
+            )
+            .order_by(HealthSample.measured_at.desc())
+            .limit(1)
+        )
+        if vm is not None:
+            summary.vo2_max = round(float(vm), 1)
+
+    if summary.sleep_rem_hours is None:
+        sleep_samples_for_day = list(
+            db.scalars(
+                select(HealthSample).where(
+                    HealthSample.deleted_at.is_(None),
+                    HealthSample.sample_type.in_(["sleep", "sleep_duration", "sleep_duration_s"]),
+                    HealthSample.measured_at >= start_dt,
+                    HealthSample.measured_at <= end_dt,
+                )
+            )
+        )
+        rem_total = sum(
+            (float(s.value) for s in sleep_samples_for_day if str((s.extra or {}).get("stage") or "").lower() == "rem"),
+            0.0,
+        )
+        if rem_total > 0:
+            summary.sleep_rem_hours = round(rem_total / 3600.0, 2)
 
     # Active feedbacks for this day
     feedback_stmt = select(HealthFeedback).where(
