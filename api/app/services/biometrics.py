@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
+from app.config import settings
 from app.models import HealthSample
 
 
@@ -255,6 +256,8 @@ def estimate_workout_active_calories(
     avg_hr: int | None,
     classification: str | None,
     weight_kg: float = 85.0,
+    age: int | None = None,
+    sex: str | None = None,
 ) -> int:
     """Estimates realistic net active calories for a workout when raw samples are depressed.
 
@@ -263,6 +266,9 @@ def estimate_workout_active_calories(
     """
     if not avg_hr or duration_mins <= 0:
         return 0
+
+    user_age = age if age is not None else settings.user_age
+    user_sex = (sex or settings.user_sex).lower()
 
     c = (classification or "").lower()
     if c in ("badminton", "sport"):

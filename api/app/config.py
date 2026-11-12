@@ -24,6 +24,23 @@ class Settings(BaseSettings):
     withings_redirect_uri: str | None = None
     kratos_api_url: str = "http://kratos-api:8000"
 
+    # User physiological profile settings
+    user_dob: str = "1986-07-16"
+    user_sex: str = "male"
+    user_height_cm: float = 169.0
+    user_max_hr: int = 186
+    user_resting_hr_baseline: int = 63
+
+    @property
+    def user_age(self) -> int:
+        try:
+            from datetime import date
+            dob = date.fromisoformat(self.user_dob)
+            today = date.today()
+            return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+        except Exception:
+            return 40
+
     @property
     def tz(self) -> zoneinfo.ZoneInfo:
         return zoneinfo.ZoneInfo(self.timezone)
