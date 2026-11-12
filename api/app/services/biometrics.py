@@ -75,10 +75,12 @@ def classify_activity_pattern(
     block_steps: Decimal,
     slot_steps: Sequence[Decimal],
     slot_hrs: Sequence[float | None],
+    slot_energies: Sequence[Decimal] | None = None,
 ) -> dict[str, str]:
     """Classifies an exertion window into a sport/workout activity pattern.
 
     Patterns:
+    - Swim: continuous aquatic propulsion, near-zero cadence (<20 steps/min), sustained Zone 2+ HR (>=115 bpm), and steady high burn rate (>=3.0 kcal/min).
     - Walk: continuous cadence (>50 steps/min), flat Zone 1/2 HR (95-115 bpm), steady burn.
     - Badminton / Court Sports: elevated HR (Zone 3-5), bursty steps, rest break intervals (>=10 min stationary gap).
     - Gym / Resistance: cyclic HR spikes alternating with rest intervals, lower step count, optional warmup jog segment.
@@ -130,7 +132,39 @@ def classify_activity_pattern(
         ):
             has_warmup_jog = True
 
-    # 1. Walk:
+    # 1. Swimming / Aquatic:
+    # - very low overall cadence (< 20 steps/min) and no warmup jog
+    # - sustained aerobic heart rate (avg_hr >= 115 bpm or peak_hr >= 130 bpm)
+    # - sustained non-stepping exertion: >= 50% of duration spent in minimal-step (< 25 steps/5m)
+    #   exertion slots with at least 10 consecutive minutes (>= 2 slots)
+    # - steady high burn rate (>= 3.0 kcal/min)
+    burn_rate = float(block_energy) / duration_mins if duration_mins > 0 else 0.0
+    minimal_step_exertion_slots = 0
+    consecutive_minimal_step = 0
+    max_consecutive_minimal_step = 0
+    for i, s_step in enumerate(slot_steps):
+        s_energy = slot_energies[i] if (slot_energies and i < len(slot_energies)) else Decimal(0)
+        s_hr = slot_hrs[i] if i < len(slot_hrs) else None
+        is_slot_exertion = (s_energy >= Decimal(15)) or (s_hr is not None and s_hr >= 110.0)
+        if s_step < Decimal(25) and is_slot_exertion:
+            minimal_step_exertion_slots += 1
+            consecutive_minimal_step += 1
+            if consecutive_minimal_step > max_consecutive_minimal_step:
+                max_consecutive_minimal_step = consecutive_minimal_step
+        else:
+            consecutive_minimal_step = 0
+
+    minimal_step_ratio = (minimal_step_exertion_slots / len(slot_steps)) if slot_steps else 0.0
+    is_swim = (
+        not has_warmup_jog
+        and cadence < 20.0
+        and (avg_hr is not None and avg_hr >= 115)
+        and max_consecutive_minimal_step >= 2
+        and minimal_step_ratio >= 0.50
+        and burn_rate >= 3.0
+    )
+
+    # 2. Walk:
     # - continuous cadence (>50 steps/min)
     # - flat Zone 1/2 HR (95-115 bpm, allow up to 120 bpm)
     # - steady burn (no long rest breaks)
@@ -142,25 +176,34 @@ def classify_activity_pattern(
         and not has_rest_break_interval
     )
 
-    # 2. Gym / Resistance:
+    # 3. Gym / Resistance:
     # - cyclic HR spikes alternating with rest intervals
     # - lower step count (< 50 steps/min) or warmup jog segment followed by resistance sets
     # - warmup jog segment explicitly classifies as gym
-    is_gym = (cadence < 50.0 or has_warmup_jog) and (
-        hr_range >= 20.0 or has_warmup_jog or cadence < 30.0
+    is_gym = (
+        not is_swim
+        and (cadence < 50.0 or has_warmup_jog)
+        and (hr_range >= 20.0 or has_warmup_jog or cadence < 30.0)
     )
 
-    # 3. Badminton / Court Sports:
+    # 4. Badminton / Court Sports:
     # - elevated HR (Zone 3-5, avg_hr >= 125 or peak_hr >= 140)
     # - sustained active court movement (cadence >= 40 steps/min)
     # - excludes gym workouts with warmup jog or low-cadence resistance lifting
     is_badminton = (
         not has_warmup_jog
+        and not is_swim
         and (cadence >= 40.0 or (cadence >= 35.0 and has_rest_break_interval))
         and ((avg_hr is not None and avg_hr >= 125) or (peak_hr is not None and peak_hr >= 140))
     )
 
-    if is_walk:
+    if is_swim:
+        return {
+            "classification": "swim",
+            "activity_type": "swim",
+            "routine_name": "Swimming",
+        }
+    elif is_walk:
         return {
             "classification": "walk",
             "activity_type": "walk",
