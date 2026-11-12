@@ -541,6 +541,188 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertEqual(workout["classification"], "gym")
         self.assertEqual(workout["routine_name"], "Resistance Training")
 
+    def test_detected_workouts_swimming_detection(self):
+        target_d = dt.date(2026, 11, 14)
+        base_time = dt.datetime(2026, 11, 14, 12, 50, tzinfo=dt.timezone.utc)
+
+        # Ingest 35 minutes of swimming (7 x 5-minute intervals)
+        # Sustained elevated HR (135 bpm), high continuous energy (~25 kcal/5m),
+        # zero steps during the swim (intervals 0-5), followed by pool exit steps in interval 6 (300 steps).
+        for m in range(0, 35, 5):
+            t = base_time + dt.timedelta(minutes=m)
+            steps = Decimal("300") if m == 30 else Decimal("0")
+            energy = Decimal("26.0")
+            hr_val = 135
+
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=energy,
+                    unit="kcal",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal(str(hr_val)),
+                    unit="bpm",
+                )
+            )
+            if steps > 0:
+                self.db.add(
+                    HealthSample(
+                        id=uuid.uuid4(),
+                        source="apple_health",
+                        sample_type="step_count",
+                        measured_at=t,
+                        ended_at=t + dt.timedelta(minutes=5),
+                        value=steps,
+                        unit="count",
+                        extra={"device": "Raymund's Apple Watch"},
+                    )
+                )
+
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data), 1)
+        workout = data[0]
+        self.assertEqual(workout["duration_minutes"], 35)
+        self.assertEqual(workout["classification"], "swim")
+        self.assertEqual(workout["activity_type"], "swim")
+        self.assertEqual(workout["routine_name"], "Swimming")
+        self.assertEqual(workout["step_count"], 300)
+        self.assertEqual(workout["avg_hr_bpm"], 135)
+        self.assertEqual(workout["active_energy_kcal"], 182)
+
+    def test_detected_workouts_swimming_transit_walk_separation(self):
+        target_d = dt.date(2026, 11, 15)
+        base_time = dt.datetime(2026, 11, 15, 12, 50, tzinfo=dt.timezone.utc)
+
+        # Swim session: 12:50 to 13:25 (7 intervals)
+        for m in range(0, 35, 5):
+            t = base_time + dt.timedelta(minutes=m)
+            steps = Decimal("200") if m == 30 else Decimal("0")
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal("25.0"),
+                    unit="kcal",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal("130"),
+                    unit="bpm",
+                )
+            )
+            if steps > 0:
+                self.db.add(
+                    HealthSample(
+                        id=uuid.uuid4(),
+                        source="apple_health",
+                        sample_type="step_count",
+                        measured_at=t,
+                        ended_at=t + dt.timedelta(minutes=5),
+                        value=steps,
+                        unit="count",
+                    )
+                )
+
+        # Gap slot with transit walk: 13:25 to 13:30 (interval 7 @ 35 min, steps = 1,000, energy = 18 kcal)
+        t_gap = base_time + dt.timedelta(minutes=35)
+        self.db.add(
+            HealthSample(
+                id=uuid.uuid4(),
+                source="apple_health",
+                sample_type="step_count",
+                measured_at=t_gap,
+                ended_at=t_gap + dt.timedelta(minutes=5),
+                value=Decimal("1000"),
+                unit="count",
+            )
+        )
+        self.db.add(
+            HealthSample(
+                id=uuid.uuid4(),
+                source="apple_health",
+                sample_type="active_energy",
+                measured_at=t_gap,
+                ended_at=t_gap + dt.timedelta(minutes=5),
+                value=Decimal("18.0"),
+                unit="kcal",
+            )
+        )
+
+        # Subsequent active walk: 13:30 to 13:40 (2 intervals @ 400 steps/5m, energy = 25 kcal, hr = 125 bpm)
+        for m in range(40, 50, 5):
+            t = base_time + dt.timedelta(minutes=m)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal("25.0"),
+                    unit="kcal",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal("125"),
+                    unit="bpm",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal("400"),
+                    unit="count",
+                )
+            )
+
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        # The transit walk gap must cleanly split the swim session from the subsequent 10m walk
+        # The 10m walk is noise-filtered (duration < 25m), leaving only the 35m swim session
+        self.assertEqual(len(data), 1)
+        workout = data[0]
+        self.assertEqual(workout["duration_minutes"], 35)
+        self.assertEqual(workout["classification"], "swim")
+        self.assertEqual(workout["routine_name"], "Swimming")
+
 
 if __name__ == "__main__":
     unittest.main()

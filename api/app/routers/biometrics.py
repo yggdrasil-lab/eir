@@ -78,11 +78,21 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
     # Merge clusters with max gap of 3 slots (15 minutes) to bridge short rest/water intervals.
     # Rest Gap Splitting: Ensure stationary intervals (>= 10 min with < 50 steps/5min)
     # split sessions into separate blocks instead of bridging across rest gaps.
+    # Transit Walk Splitting: Ensure transit walking intervals (>= 250 steps for low-cadence
+    # activities like swimming, or >= 500 steps fleet-wide) split sessions rather than merging.
     clusters: list[tuple[int, int]] = []
     curr = [active_indices[0]]
     for idx in active_indices[1:]:
         gap_has_stationary_rest = False
         consecutive_stationary = 0
+        gap_has_transit_walk = False
+
+        curr_total_steps = sum(
+            deduplicate_step_samples(slots[c]["step_samples"]) if slots[c]["step_samples"] else Decimal(0)
+            for c in curr
+        )
+        curr_cadence = float(curr_total_steps) / (len(curr) * 5) if curr else 0.0
+
         for g_idx in range(curr[-1] + 1, idx):
             g_steps = (
                 deduplicate_step_samples(slots[g_idx]["step_samples"])
@@ -97,7 +107,13 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
             else:
                 consecutive_stationary = 0
 
-        if (idx - curr[-1] <= 3) and not gap_has_stationary_rest:
+            # Transit walk detection: if non-walking activity (cadence < 25) and gap steps >= 250,
+            # or any activity and gap steps >= 500 (e.g. outdoor transit walk between sessions)
+            if (curr_cadence < 25.0 and g_steps >= Decimal(250)) or (g_steps >= Decimal(500)):
+                gap_has_transit_walk = True
+                break
+
+        if (idx - curr[-1] <= 3) and not gap_has_stationary_rest and not gap_has_transit_walk:
             curr.append(idx)
         else:
             clusters.append((curr[0], curr[-1]))
@@ -112,6 +128,7 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
         all_hrs: list[float] = []
         slot_hrs: list[float | None] = []
         slot_steps: list[Decimal] = []
+        slot_energies: list[Decimal] = []
         for i in range(start_idx, end_idx + 1):
             all_hrs.extend(slots[i]["hr_vals"])
             s_hr = (
@@ -126,6 +143,7 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                 else Decimal(0)
             )
             slot_steps.append(s_steps)
+            slot_energies.append(slots[i]["energy"])
 
         avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
         peak_hr = int(round(max(all_hrs))) if all_hrs else None
@@ -144,12 +162,16 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
         # 1. High-intensity workout: >= 30 mins AND (energy >= 250 kcal OR avg HR >= 120)
         # 2. Sustained walking: >= 25 mins AND block_steps >= 1500 AND avg HR >= 90
         # 3. Gym / Resistance: >= 30 mins AND block_energy >= 120 kcal AND (hr_spread >= 20 OR peak_hr >= 115)
+        # 4. Swimming / Aquatic: >= 20 mins AND block_energy >= 100 kcal AND (avg_hr is not None and avg_hr >= 110) AND cadence < 25
         hr_spread = (max(all_hrs) - min(all_hrs)) if all_hrs else 0
+        cadence = float(block_steps) / duration_mins if duration_mins > 0 else 0.0
+
         is_high_intensity = duration_mins >= 30 and (block_energy >= Decimal(250) or (avg_hr is not None and avg_hr >= 120))
         is_sustained_walk = duration_mins >= 25 and (block_steps >= Decimal(1500)) and (avg_hr is None or avg_hr >= 90)
         is_resistance = duration_mins >= 30 and block_energy >= Decimal(120) and (hr_spread >= 20 or (peak_hr is not None and peak_hr >= 115))
+        is_swim = duration_mins >= 20 and block_energy >= Decimal(100) and (avg_hr is not None and avg_hr >= 110) and cadence < 25.0
 
-        if is_high_intensity or is_sustained_walk or is_resistance:
+        if is_high_intensity or is_sustained_walk or is_resistance or is_swim:
             conf = "high" if (avg_hr and avg_hr >= 130 and block_energy >= Decimal(350)) else "medium"
             pattern = classify_activity_pattern(
                 duration_mins=duration_mins,
@@ -160,6 +182,7 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                 block_steps=block_steps,
                 slot_steps=slot_steps,
                 slot_hrs=slot_hrs,
+                slot_energies=slot_energies,
             )
             detected.append(
                 DetectedWorkoutRead(

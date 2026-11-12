@@ -149,17 +149,27 @@ def sync_detected_workouts_to_kratos(
                     existing_extra["step_count"] = w.step_count
                 existing_extra["telemetry_source"] = "apple_health_detected"
                 existing_extra["telemetry_reconciled"] = True
-                if not existing_extra.get("classification"):
+                if not is_confirmed:
                     existing_extra["classification"] = w.classification
-                if not existing_extra.get("routine_name"):
+                    existing_extra["activity_type"] = w.activity_type
                     existing_extra["routine_name"] = w.routine_name
+                    existing_extra["duration_minutes"] = w.duration_minutes
+                else:
+                    if not existing_extra.get("classification"):
+                        existing_extra["classification"] = w.classification
+                    if not existing_extra.get("routine_name"):
+                        existing_extra["routine_name"] = w.routine_name
 
                 reconciled_payload = {
                     "id": target_id,
                     "routine_id": matched_session.get("routine_id"),
-                    "started_at": matched_session.get("started_at") or start_iso,
-                    "ended_at": matched_session.get("ended_at") or end_iso,
-                    "notes": matched_session.get("notes") or f"Auto-detected {w.routine_name or 'workout'} from Apple Health biometrics",
+                    "started_at": matched_session.get("started_at") if is_confirmed else start_iso,
+                    "ended_at": matched_session.get("ended_at") if is_confirmed else end_iso,
+                    "notes": (
+                        matched_session.get("notes")
+                        if (is_confirmed and matched_session.get("notes"))
+                        else f"Auto-detected {w.routine_name or 'workout'} from Apple Health biometrics"
+                    ),
                     "extra": existing_extra,
                     "items": matched_session.get("items") or [],
                 }
