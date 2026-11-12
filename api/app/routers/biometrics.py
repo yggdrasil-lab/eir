@@ -18,7 +18,11 @@ from app.schemas import (
     DetectedWorkoutRead,
     HealthSampleRead,
 )
-from app.services.biometrics import classify_activity_pattern, deduplicate_step_samples
+from app.services.biometrics import (
+    classify_activity_pattern,
+    compute_workout_exertion_metrics,
+    deduplicate_step_samples,
+)
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
 
@@ -184,6 +188,33 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                 slot_hrs=slot_hrs,
                 slot_energies=slot_energies,
             )
+            exertion = compute_workout_exertion_metrics(
+                all_hrs=all_hrs,
+                duration_mins=duration_mins,
+                block_energy=block_energy,
+            )
+
+            # Post-workout heart rate recovery (drop 60-90s post-exercise)
+            hr_recovery_60s = None
+            if all_hrs:
+                post_e_time = e_time + timedelta(seconds=90)
+                post_hrs = [
+                    float(s.value)
+                    for s in samples
+                    if s.sample_type in ("heart_rate", "resting_hr")
+                    and e_time
+                    <= (
+                        s.measured_at.astimezone(settings.tz)
+                        if s.measured_at.tzinfo
+                        else s.measured_at.replace(tzinfo=settings.tz)
+                    )
+                    <= post_e_time
+                ]
+                if post_hrs:
+                    drop = all_hrs[-1] - min(post_hrs)
+                    if drop > 0:
+                        hr_recovery_60s = int(round(drop))
+
             detected.append(
                 DetectedWorkoutRead(
                     started_at=s_time,
@@ -197,6 +228,11 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                     classification=pattern["classification"],
                     activity_type=pattern["activity_type"],
                     routine_name=pattern["routine_name"],
+                    effort_rating=exertion["effort_rating"],
+                    rpe=exertion["rpe"],
+                    trimp=exertion["trimp"],
+                    hr_zones=exertion["hr_zones"],
+                    hr_recovery_60s=hr_recovery_60s,
                 )
             )
 

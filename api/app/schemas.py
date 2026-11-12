@@ -199,6 +199,11 @@ class DetectedWorkoutRead(BaseModel):
     activity_type: str | None = None
     classification: str | None = None
     routine_name: str | None = None
+    effort_rating: str | None = None  # 'too_easy', 'optimal', 'hard', 'too_hard'
+    rpe: float | None = None  # 1.0 - 10.0 scale
+    trimp: float | None = None  # Edwards TRIMP score
+    hr_zones: dict[str, Any] | None = None  # Z1-Z5 percentage and duration breakdown
+    hr_recovery_60s: int | None = None  # Post-exercise 60s heart rate drop in bpm
 
 
 class DailyBiometricSummary(BaseModel):

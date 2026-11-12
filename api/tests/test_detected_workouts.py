@@ -780,6 +780,19 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertEqual(workout["classification"], "badminton")
         self.assertEqual(workout["activity_type"], "badminton")
         self.assertEqual(workout["routine_name"], "Badminton Match Play")
+        # Assert effort rating, RPE, TRIMP, and HR zones are populated
+        self.assertIn(workout["effort_rating"], ["optimal", "hard", "too_hard"])
+        self.assertIsInstance(workout["rpe"], float)
+        self.assertGreaterEqual(workout["rpe"], 5.0)
+        self.assertLessEqual(workout["rpe"], 10.0)
+        self.assertIsInstance(workout["trimp"], float)
+        self.assertGreater(workout["trimp"], 0.0)
+        self.assertIsNotNone(workout["hr_zones"])
+        self.assertIn("z1_recovery_pct", workout["hr_zones"])
+        self.assertIn("z2_aerobic_pct", workout["hr_zones"])
+        self.assertIn("z3_tempo_pct", workout["hr_zones"])
+        self.assertIn("z4_threshold_pct", workout["hr_zones"])
+        self.assertIn("z5_anaerobic_pct", workout["hr_zones"])
 
 
 if __name__ == "__main__":

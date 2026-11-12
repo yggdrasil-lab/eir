@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 
 from app.models import HealthSample
 
@@ -247,3 +248,95 @@ def classify_activity_pattern(
             "activity_type": "gym",
             "routine_name": "Resistance Training",
         }
+
+
+def compute_workout_exertion_metrics(
+    all_hrs: Sequence[float],
+    duration_mins: int,
+    block_energy: Decimal,
+    max_hr: float = 186.0,
+    rest_hr: float = 63.0,
+) -> dict[str, Any]:
+    """Computes heart rate zones, Edwards TRIMP score, and inferred RPE/effort rating.
+
+    HR Zones (% of max HR):
+    - Zone 1 (< 60% max HR, < 112 bpm): Active Recovery
+    - Zone 2 (60% - 69% max HR, 112 - 129 bpm): Aerobic Base
+    - Zone 3 (70% - 79% max HR, 130 - 148 bpm): Tempo / Aerobic Endurance
+    - Zone 4 (80% - 89% max HR, 149 - 166 bpm): Anaerobic Threshold
+    - Zone 5 (>= 90% max HR, >= 167 bpm): Anaerobic Capacity / Neuromuscular
+    """
+    if not all_hrs:
+        return {
+            "effort_rating": "optimal",
+            "rpe": 6.0,
+            "trimp": 0.0,
+            "hr_zones": None,
+        }
+
+    total_pts = len(all_hrs)
+    avg_hr = sum(all_hrs) / total_pts
+    peak_hr = max(all_hrs)
+
+    z1_count = sum(1 for h in all_hrs if h < 112.0)
+    z2_count = sum(1 for h in all_hrs if 112.0 <= h < 130.0)
+    z3_count = sum(1 for h in all_hrs if 130.0 <= h < 149.0)
+    z4_count = sum(1 for h in all_hrs if 149.0 <= h < 167.0)
+    z5_count = sum(1 for h in all_hrs if h >= 167.0)
+
+    pct_z1 = round((z1_count / total_pts) * 100.0, 1)
+    pct_z2 = round((z2_count / total_pts) * 100.0, 1)
+    pct_z3 = round((z3_count / total_pts) * 100.0, 1)
+    pct_z4 = round((z4_count / total_pts) * 100.0, 1)
+    pct_z5 = round((z5_count / total_pts) * 100.0, 1)
+
+    mins_z1 = round((z1_count / total_pts) * duration_mins, 1)
+    mins_z2 = round((z2_count / total_pts) * duration_mins, 1)
+    mins_z3 = round((z3_count / total_pts) * duration_mins, 1)
+    mins_z4 = round((z4_count / total_pts) * duration_mins, 1)
+    mins_z5 = round((z5_count / total_pts) * duration_mins, 1)
+
+    trimp = round(
+        mins_z1 * 1.0
+        + mins_z2 * 2.0
+        + mins_z3 * 3.0
+        + mins_z4 * 4.0
+        + mins_z5 * 5.0,
+        1,
+    )
+
+    high_intensity_pct = pct_z4 + pct_z5
+    if (pct_z5 >= 50.0 and avg_hr >= 160.0) or (
+        pct_z5 >= 40.0 and duration_mins >= 50 and avg_hr >= 160.0
+    ):
+        effort_rating = "too_hard"
+        rpe = round(min(10.0, 9.0 + (avg_hr - 160.0) * 0.1), 1)
+    elif pct_z5 >= 35.0 or high_intensity_pct >= 60.0 or avg_hr >= 150.0:
+        effort_rating = "hard"
+        rpe = round(min(8.9, 8.0 + (pct_z5 / 100.0) * 1.5), 1)
+    elif high_intensity_pct >= 15.0 or pct_z3 >= 30.0 or avg_hr >= 120.0:
+        effort_rating = "optimal"
+        rpe = round(min(7.9, 5.0 + (pct_z3 + pct_z4) / 100.0 * 2.5), 1)
+    else:
+        effort_rating = "too_easy"
+        rpe = round(max(1.0, 2.0 + (avg_hr - 60.0) * 0.05), 1)
+
+    hr_zones = {
+        "z1_recovery_pct": pct_z1,
+        "z2_aerobic_pct": pct_z2,
+        "z3_tempo_pct": pct_z3,
+        "z4_threshold_pct": pct_z4,
+        "z5_anaerobic_pct": pct_z5,
+        "z1_mins": mins_z1,
+        "z2_mins": mins_z2,
+        "z3_mins": mins_z3,
+        "z4_mins": mins_z4,
+        "z5_mins": mins_z5,
+    }
+
+    return {
+        "effort_rating": effort_rating,
+        "rpe": rpe,
+        "trimp": trimp,
+        "hr_zones": hr_zones,
+    }
