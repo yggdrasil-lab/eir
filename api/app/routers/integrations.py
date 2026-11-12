@@ -199,7 +199,7 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
         elif stage == "rem":
             sleep_rem_s += val
 
-    # 6. Active energy
+    # 6. Active energy (including floor from detected workouts with estimated calorie fallbacks)
     energy_kcal = db.scalar(
         select(func.sum(HealthSample.value)).where(
             HealthSample.deleted_at.is_(None),
@@ -208,6 +208,12 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
             HealthSample.measured_at <= end_dt,
         )
     )
+    detected_for_day = detect_workouts_for_day(db, target_date)
+    detected_energy_total = sum(w.active_energy_kcal for w in detected_for_day)
+    if energy_kcal is not None and detected_energy_total > float(energy_kcal):
+        energy_kcal = Decimal(detected_energy_total)
+    elif energy_kcal is None and detected_energy_total > 0:
+        energy_kcal = Decimal(detected_energy_total)
 
     # 7. Step count with smart multi-device deduplication (Apple Watch vs iPhone)
     step_samples = db.scalars(

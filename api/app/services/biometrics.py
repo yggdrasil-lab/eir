@@ -250,6 +250,47 @@ def classify_activity_pattern(
         }
 
 
+def estimate_workout_active_calories(
+    duration_mins: int,
+    avg_hr: int | None,
+    classification: str | None,
+    weight_kg: float = 85.0,
+) -> int:
+    """Estimates realistic net active calories for a workout when raw samples are depressed.
+
+    Triggers when Apple Watch background passive monitoring mode causes severe
+    undercounting (< 3.5 kcal/min despite elevated heart rate >= 115 bpm).
+    """
+    if not avg_hr or duration_mins <= 0:
+        return 0
+
+    c = (classification or "").lower()
+    if c in ("badminton", "sport"):
+        if avg_hr >= 160:
+            met = 9.0
+        elif avg_hr >= 145:
+            met = 8.0
+        else:
+            met = 7.0
+    elif c in ("swim", "swimming"):
+        met = 7.5 if avg_hr >= 130 else 6.0
+    elif c in ("gym", "resistance"):
+        met = 5.5 if avg_hr >= 125 else 4.5
+    elif c in ("walk", "walking"):
+        met = 4.2 if avg_hr >= 105 else 3.5
+    else:
+        if avg_hr >= 150:
+            met = 8.0
+        elif avg_hr >= 130:
+            met = 6.5
+        else:
+            met = 5.0
+
+    # Net active kcal = (MET - 1.0) * weight_kg * (duration_mins / 60)
+    net_active = (met - 1.0) * weight_kg * (duration_mins / 60.0)
+    return int(round(net_active))
+
+
 def compute_workout_exertion_metrics(
     all_hrs: Sequence[float],
     duration_mins: int,
