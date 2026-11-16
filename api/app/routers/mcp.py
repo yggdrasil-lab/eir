@@ -255,6 +255,44 @@ def build_mcp_server() -> MCPServer:
             db.refresh(measurement)
             return json.dumps(_serialise_measurement(measurement))
 
+    @server.tool(
+        name="eir_get_workout_metrics",
+        description=(
+            "Compute full workout exertion metrics (HR zones, TRIMP, RPE, effort_rating, "
+            "active_energy_kcal, avg/peak HR, step_count, hr_recovery_60s) for a specific "
+            "ISO-8601 [started_at, ended_at] window. Use when manually splitting or creating "
+            "Kratos sessions."
+        ),
+    )
+    def get_workout_metrics(
+        started_at: str,
+        ended_at: str,
+        classification: str | None = None,
+        activity_type: str | None = None,
+        routine_name: str | None = None,
+    ) -> str:
+        from app.routers.biometrics import compute_workout_metrics_for_window
+
+        try:
+            s_dt = datetime.fromisoformat(started_at)
+            e_dt = datetime.fromisoformat(ended_at)
+        except ValueError as exc:
+            raise ToolError(f"Invalid ISO-8601 timestamp: {exc}") from exc
+
+        if e_dt <= s_dt:
+            raise ToolError("ended_at must be after started_at")
+
+        with mcp_session() as db:
+            result = compute_workout_metrics_for_window(
+                db,
+                started_at=s_dt,
+                ended_at=e_dt,
+                classification=classification,
+                activity_type=activity_type,
+                routine_name=routine_name,
+            )
+            return result.model_dump_json()
+
     return server
 
 

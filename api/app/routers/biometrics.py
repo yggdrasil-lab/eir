@@ -28,6 +28,210 @@ from app.services.biometrics import (
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
 
 
+def _sample_local_dt(s: HealthSample) -> datetime:
+    """Normalizes a HealthSample timestamp to settings.tz."""
+    return s.measured_at.astimezone(settings.tz) if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=settings.tz)
+
+
+def _build_detected_workout(
+    db: Session,
+    *,
+    s_time: datetime,
+    e_time: datetime,
+    end_dt: datetime,
+    duration_mins: int,
+    block_energy: Decimal,
+    all_hrs: list[float],
+    block_steps: Decimal,
+    samples: list[HealthSample],
+    pattern: dict[str, str],
+    confidence: str,
+) -> DetectedWorkoutRead:
+    """Builds a DetectedWorkoutRead with calorie fallback, exertion metrics, and HR recovery."""
+    avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
+    peak_hr = int(round(max(all_hrs))) if all_hrs else None
+    final_energy_kcal = int(round(block_energy))
+    energy_rate = float(block_energy) / duration_mins if duration_mins > 0 else 0.0
+
+    # Calorie undercounting fallback: when avg_hr indicates sustained exertion (>= 115 bpm)
+    # but raw energy burn rate is suspiciously low (< 3.5 kcal/min), Apple Watch was in
+    # passive background mode rather than active workout mode. Fall back to physiological MET estimate.
+    if (avg_hr is not None and avg_hr >= 115) and energy_rate < 3.5:
+        latest_weight = (
+            db.scalar(
+                select(HealthSample.value)
+                .where(
+                    HealthSample.deleted_at.is_(None),
+                    HealthSample.sample_type.in_(["weight", "weight_kg"]),
+                    HealthSample.measured_at <= end_dt,
+                )
+                .order_by(HealthSample.measured_at.desc())
+                .limit(1)
+            )
+            or 85.0
+        )
+        estimated_energy = estimate_workout_active_calories(
+            duration_mins=duration_mins,
+            avg_hr=avg_hr,
+            classification=pattern["classification"],
+            weight_kg=float(latest_weight),
+        )
+        if estimated_energy > final_energy_kcal:
+            final_energy_kcal = estimated_energy
+
+    exertion = compute_workout_exertion_metrics(
+        all_hrs=all_hrs,
+        duration_mins=duration_mins,
+        block_energy=Decimal(final_energy_kcal),
+    )
+
+    # Post-workout heart rate recovery (drop 60-90s post-exercise)
+    hr_recovery_60s = None
+    if all_hrs:
+        post_e_time = e_time + timedelta(seconds=90)
+        post_hrs = [
+            float(s.value)
+            for s in samples
+            if s.sample_type in ("heart_rate", "resting_hr")
+            and e_time <= _sample_local_dt(s) <= post_e_time
+        ]
+        if post_hrs:
+            drop = all_hrs[-1] - min(post_hrs)
+            if drop > 0:
+                hr_recovery_60s = int(round(drop))
+
+    return DetectedWorkoutRead(
+        started_at=s_time,
+        ended_at=e_time,
+        duration_minutes=duration_mins,
+        active_energy_kcal=final_energy_kcal,
+        avg_hr_bpm=avg_hr,
+        peak_hr_bpm=peak_hr,
+        step_count=int(round(block_steps)) if block_steps > 0 else None,
+        confidence=confidence,
+        classification=pattern["classification"],
+        activity_type=pattern["activity_type"],
+        routine_name=pattern["routine_name"],
+        effort_rating=exertion["effort_rating"],
+        rpe=exertion["rpe"],
+        trimp=exertion["trimp"],
+        hr_zones=exertion["hr_zones"],
+        hr_recovery_60s=hr_recovery_60s,
+    )
+
+
+def compute_workout_metrics_for_window(
+    db: Session,
+    started_at: datetime,
+    ended_at: datetime,
+    classification: str | None = None,
+    activity_type: str | None = None,
+    routine_name: str | None = None,
+) -> DetectedWorkoutRead:
+    """Computes full Eir workout exertion metrics (HR zones, TRIMP, RPE, steps, recovery) for any window."""
+    s_time = started_at.astimezone(settings.tz) if started_at.tzinfo else started_at.replace(tzinfo=settings.tz)
+    e_time = ended_at.astimezone(settings.tz) if ended_at.tzinfo else ended_at.replace(tzinfo=settings.tz)
+    if e_time <= s_time:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="ended_at must be after started_at",
+        )
+
+    post_e_time = e_time + timedelta(seconds=90)
+    samples = list(
+        db.scalars(
+            select(HealthSample)
+            .where(
+                HealthSample.deleted_at.is_(None),
+                HealthSample.sample_type.in_(["active_energy", "heart_rate", "step_count"]),
+                HealthSample.measured_at >= s_time,
+                HealthSample.measured_at <= post_e_time,
+            )
+            .order_by(HealthSample.measured_at.asc())
+        )
+    )
+
+    duration_mins = max(1, int(round((e_time - s_time).total_seconds() / 60)))
+    block_energy = sum(
+        (
+            s.value
+            for s in samples
+            if s.sample_type in ("active_energy", "active_energy_kcal")
+            and s_time <= _sample_local_dt(s) < e_time
+        ),
+        Decimal(0),
+    )
+    all_hrs = [
+        float(s.value)
+        for s in samples
+        if s.sample_type in ("heart_rate", "resting_hr")
+        and s_time <= _sample_local_dt(s) <= e_time
+    ]
+    step_samples = [
+        s
+        for s in samples
+        if s.sample_type in ("step_count", "steps")
+        and s_time <= _sample_local_dt(s) < e_time
+    ]
+    block_steps = deduplicate_step_samples(step_samples)
+    avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
+    peak_hr = int(round(max(all_hrs))) if all_hrs else None
+
+    if classification or activity_type or routine_name:
+        cls_val = classification or activity_type or "gym"
+        pattern = {
+            "classification": cls_val,
+            "activity_type": activity_type or cls_val,
+            "routine_name": routine_name or "Workout",
+        }
+    else:
+        num_slots = max(1, (duration_mins + 4) // 5)
+        slot_steps = [Decimal(0)] * num_slots
+        slot_hr_lists: list[list[float]] = [[] for _ in range(num_slots)]
+        slot_energies = [Decimal(0)] * num_slots
+        for s in samples:
+            dt_val = _sample_local_dt(s)
+            if not (s_time <= dt_val < e_time):
+                continue
+            idx = min(num_slots - 1, int((dt_val - s_time).total_seconds() // 300))
+            if s.sample_type in ("active_energy", "active_energy_kcal"):
+                slot_energies[idx] += s.value
+            elif s.sample_type in ("heart_rate", "resting_hr"):
+                slot_hr_lists[idx].append(float(s.value))
+        for i in range(num_slots):
+            slot_s = s_time + timedelta(minutes=i * 5)
+            slot_e = slot_s + timedelta(minutes=5)
+            slot_steps[i] = deduplicate_step_samples(
+                [x for x in step_samples if slot_s <= _sample_local_dt(x) < slot_e]
+            )
+        slot_hrs = [(sum(h) / len(h)) if h else None for h in slot_hr_lists]
+        pattern = classify_activity_pattern(
+            duration_mins=duration_mins,
+            block_energy=block_energy,
+            avg_hr=avg_hr,
+            peak_hr=peak_hr,
+            all_hrs=all_hrs,
+            block_steps=block_steps,
+            slot_steps=slot_steps,
+            slot_hrs=slot_hrs,
+            slot_energies=slot_energies,
+        )
+
+    return _build_detected_workout(
+        db,
+        s_time=s_time,
+        e_time=e_time,
+        end_dt=e_time,
+        duration_mins=duration_mins,
+        block_energy=block_energy,
+        all_hrs=all_hrs,
+        block_steps=block_steps,
+        samples=samples,
+        pattern=pattern,
+        confidence="high",
+    )
+
+
 def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWorkoutRead]:
     """Infers sustained physical exertion blocks from granular active energy and heart rate samples."""
     start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
@@ -189,79 +393,19 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                 slot_hrs=slot_hrs,
                 slot_energies=slot_energies,
             )
-            final_energy_kcal = int(round(block_energy))
-            energy_rate = float(block_energy) / duration_mins if duration_mins > 0 else 0.0
-            # Calorie undercounting fallback: when avg_hr indicates sustained exertion (>= 115 bpm)
-            # but raw energy burn rate is suspiciously low (< 3.5 kcal/min), Apple Watch was in
-            # passive background mode rather than active workout mode. Fall back to physiological MET estimate.
-            if (avg_hr is not None and avg_hr >= 115) and energy_rate < 3.5:
-                latest_weight = (
-                    db.scalar(
-                        select(HealthSample.value)
-                        .where(
-                            HealthSample.deleted_at.is_(None),
-                            HealthSample.sample_type.in_(["weight", "weight_kg"]),
-                            HealthSample.measured_at <= end_dt,
-                        )
-                        .order_by(HealthSample.measured_at.desc())
-                        .limit(1)
-                    )
-                    or 85.0
-                )
-                estimated_energy = estimate_workout_active_calories(
-                    duration_mins=duration_mins,
-                    avg_hr=avg_hr,
-                    classification=pattern["classification"],
-                    weight_kg=float(latest_weight),
-                )
-                if estimated_energy > final_energy_kcal:
-                    final_energy_kcal = estimated_energy
-
-            exertion = compute_workout_exertion_metrics(
-                all_hrs=all_hrs,
-                duration_mins=duration_mins,
-                block_energy=Decimal(final_energy_kcal),
-            )
-
-            # Post-workout heart rate recovery (drop 60-90s post-exercise)
-            hr_recovery_60s = None
-            if all_hrs:
-                post_e_time = e_time + timedelta(seconds=90)
-                post_hrs = [
-                    float(s.value)
-                    for s in samples
-                    if s.sample_type in ("heart_rate", "resting_hr")
-                    and e_time
-                    <= (
-                        s.measured_at.astimezone(settings.tz)
-                        if s.measured_at.tzinfo
-                        else s.measured_at.replace(tzinfo=settings.tz)
-                    )
-                    <= post_e_time
-                ]
-                if post_hrs:
-                    drop = all_hrs[-1] - min(post_hrs)
-                    if drop > 0:
-                        hr_recovery_60s = int(round(drop))
-
             detected.append(
-                DetectedWorkoutRead(
-                    started_at=s_time,
-                    ended_at=e_time,
-                    duration_minutes=duration_mins,
-                    active_energy_kcal=final_energy_kcal,
-                    avg_hr_bpm=avg_hr,
-                    peak_hr_bpm=peak_hr,
-                    step_count=int(round(block_steps)) if block_steps > 0 else None,
+                _build_detected_workout(
+                    db,
+                    s_time=s_time,
+                    e_time=e_time,
+                    end_dt=end_dt,
+                    duration_mins=duration_mins,
+                    block_energy=block_energy,
+                    all_hrs=all_hrs,
+                    block_steps=block_steps,
+                    samples=samples,
+                    pattern=pattern,
                     confidence=conf,
-                    classification=pattern["classification"],
-                    activity_type=pattern["activity_type"],
-                    routine_name=pattern["routine_name"],
-                    effort_rating=exertion["effort_rating"],
-                    rpe=exertion["rpe"],
-                    trimp=exertion["trimp"],
-                    hr_zones=exertion["hr_zones"],
-                    hr_recovery_60s=hr_recovery_60s,
                 )
             )
 
@@ -507,6 +651,26 @@ def get_detected_workouts(
 ) -> list[DetectedWorkoutRead]:
     """Scans high-resolution biometrics to detect unlogged physical exertion blocks."""
     return detect_workouts_for_day(db, target_date)
+
+
+@router.get("/workout-metrics", response_model=DetectedWorkoutRead)
+def get_workout_metrics(
+    started_at: datetime = Query(description="Window start ISO-8601 timestamp"),
+    ended_at: datetime = Query(description="Window end ISO-8601 timestamp"),
+    classification: str | None = Query(default=None, description="Optional activity classification override"),
+    activity_type: str | None = Query(default=None, description="Optional activity_type override"),
+    routine_name: str | None = Query(default=None, description="Optional routine_name override"),
+    db: Session = Depends(get_db),
+) -> DetectedWorkoutRead:
+    """Computes full exertion metrics (HR zones, TRIMP, RPE, steps, recovery) for an arbitrary window."""
+    return compute_workout_metrics_for_window(
+        db,
+        started_at=started_at,
+        ended_at=ended_at,
+        classification=classification,
+        activity_type=activity_type,
+        routine_name=routine_name,
+    )
 
 
 @router.get("", response_model=list[BiometricRead])
