@@ -794,6 +794,112 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertIn("z4_threshold_pct", workout["hr_zones"])
         self.assertIn("z5_anaerobic_pct", workout["hr_zones"])
 
+    def test_recorded_workout_boundaries_split_back_to_back_sessions(self):
+        """Calibrated from 2026-11-16: 60m gym class immediately followed by 35m weightlifting + unlogged walk."""
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        target_d = dt.date(2026, 11, 16)
+
+        # Back-to-back high-HR class (17:35-18:35) and weightlifting (18:35-19:10) with zero gap
+        class_slots = [
+            (17, 35, 106, 1.2, 769),
+            (17, 40, 139, 27.7, 0),
+            (17, 45, 154, 45.5, 889),
+            (17, 50, 162, 50.3, 0),
+            (17, 55, 166, 52.0, 759),
+            (18, 0, 159, 48.5, 0),
+            (18, 5, 144, 41.4, 315),
+            (18, 10, 127, 27.0, 0),
+            (18, 15, 142, 4.9, 423),
+            (18, 20, 153, 44.5, 0),
+            (18, 25, 148, 43.0, 146),
+            (18, 30, 135, 37.2, 0),
+        ]
+        lifting_slots = [
+            (18, 35, 133, 25.2, 404),
+            (18, 40, 131, 23.3, 235),
+            (18, 45, 144, 35.1, 175),
+            (18, 50, 130, 25.4, 46),
+            (18, 55, 135, 24.6, 66),
+            (19, 0, 126, 16.3, 782),
+            (19, 5, 126, 6.7, 0),
+        ]
+        walk_slots = [
+            (20, 20, 102, 2.5, 462),
+            (20, 25, 115, 9.7, 920),
+            (20, 30, 112, 16.3, 774),
+            (20, 35, 117, 12.5, 683),
+            (20, 40, 114, 13.8, 554),
+        ]
+
+        hr_dates, hr_values = [], []
+        ae_dates, ae_values = [], []
+        step_dates, step_end_dates, step_values = [], [], []
+        for h, m, hr, kcal, steps in class_slots + lifting_slots + walk_slots:
+            t = dt.datetime(2026, 11, 16, h, m, tzinfo=nz_tz)
+            t_end = t + dt.timedelta(minutes=5)
+            hr_dates.append(t.isoformat())
+            hr_values.append(hr)
+            ae_dates.append(t.isoformat())
+            ae_values.append(kcal)
+            if steps > 0:
+                step_dates.append(t.isoformat())
+                step_end_dates.append(t_end.isoformat())
+                step_values.append(steps)
+
+        # Ingest via /integrations/apple-health/sync with explicit Apple Watch workout boundaries
+        # for the gym class and weightlifting, leaving the evening walk to passive fallback.
+        payload = {
+            "heart_rate_dates": hr_dates,
+            "heart_rate_values": hr_values,
+            "active_energy_dates": ae_dates,
+            "active_energy_values": ae_values,
+            "step_dates": step_dates,
+            "step_end_dates": step_end_dates,
+            "step_values": step_values,
+            "workout_start_dates": [
+                dt.datetime(2026, 11, 16, 17, 35, tzinfo=nz_tz).isoformat(),
+                dt.datetime(2026, 11, 16, 18, 35, tzinfo=nz_tz).isoformat(),
+            ],
+            "workout_end_dates": [
+                dt.datetime(2026, 11, 16, 18, 35, tzinfo=nz_tz).isoformat(),
+                dt.datetime(2026, 11, 16, 19, 10, tzinfo=nz_tz).isoformat(),
+            ],
+            "workout_types": [
+                "High Intensity Interval Training",
+                "Traditional Strength Training",
+            ],
+            "workout_sources": ["Apple Watch", "Apple Watch"],
+        }
+        from unittest.mock import patch
+
+        with patch("app.routers.integrations.sync_detected_workouts_to_kratos"):
+            sync_res = self.client.post("/integrations/apple-health/sync", json=payload)
+        self.assertEqual(sync_res.status_code, 201)
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data), 3)
+
+        # 1. Gym class (60 min)
+        self.assertEqual(data[0]["duration_minutes"], 60)
+        self.assertEqual(data[0]["classification"], "gym")
+        self.assertEqual(data[0]["routine_name"], "Gym Class / HIIT")
+        self.assertEqual(data[0]["confidence"], "high")
+
+        # 2. Weightlifting (35 min)
+        self.assertEqual(data[1]["duration_minutes"], 35)
+        self.assertEqual(data[1]["classification"], "gym")
+        self.assertEqual(data[1]["routine_name"], "Resistance Training")
+        self.assertEqual(data[1]["confidence"], "high")
+
+        # 3. Passive fallback evening walk (25 min)
+        self.assertEqual(data[2]["duration_minutes"], 25)
+        self.assertEqual(data[2]["classification"], "walk")
+        self.assertEqual(data[2]["routine_name"], "Walk / Cardio")
+
 
 if __name__ == "__main__":
     unittest.main()

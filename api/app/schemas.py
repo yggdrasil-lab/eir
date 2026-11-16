@@ -320,6 +320,7 @@ DEFAULT_METRIC_UNITS: dict[str, str] = {
     "wrist_temperature": "C",
     "respiratory_rate": "breaths/min",
     "walking_asymmetry": "%",
+    "workout": "s",
 }
 
 METRIC_ALIASES: dict[str, str] = {
@@ -358,6 +359,8 @@ METRIC_ALIASES: dict[str, str] = {
     "blood_oxygen": "oxygen_saturation",
     "cardio_fitness": "vo2_max",
     "vo2max": "vo2_max",
+    "workouts": "workout",
+    "workout_sessions": "workout",
 }
 
 
@@ -506,6 +509,66 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
                                 ended_at=end,
                                 value=duration_s,
                                 sample_type="sleep",
+                                unit="s",
+                                source=self.source,
+                                extra=extra_meta,
+                            )
+                        )
+            elif canonical_type == "workout":
+                w_types = _to_list(
+                    extra_fields.get(f"{prefix}_types")
+                    or extra_fields.get(f"{prefix}_names")
+                    or (
+                        raw_vals
+                        if raw_vals
+                        and any(isinstance(x, str) and not re.match(r"^[\d\.:]+$", str(x).strip()) for x in raw_vals)
+                        else []
+                    )
+                )
+                w_energies = _to_list(
+                    extra_fields.get(f"{prefix}_energies")
+                    or extra_fields.get(f"{prefix}_calories")
+                    or extra_fields.get(f"{prefix}_active_energy")
+                )
+                max_len = max(len(s_dates), len(e_dates), len(durations), len(raw_vals), len(w_types), len(sources))
+
+                for i in range(max_len):
+                    st = s_dates[i] if i < len(s_dates) else None
+                    if not st:
+                        continue
+                    end = e_dates[i] if i < len(e_dates) else st
+                    dur = durations[i] if i < len(durations) else None
+                    val = raw_vals[i] if i < len(raw_vals) else None
+                    w_type = w_types[i] if i < len(w_types) else None
+                    w_energy = _clean_numeric(w_energies[i]) if i < len(w_energies) else None
+
+                    duration_s: Decimal | None = None
+                    st_dt = _clean_datetime(st)
+                    end_dt = _clean_datetime(end)
+                    if isinstance(st_dt, datetime) and isinstance(end_dt, datetime) and end_dt > st_dt:
+                        duration_s = Decimal(str(round((end_dt - st_dt).total_seconds(), 2)))
+                    elif dur:
+                        duration_s = _parse_duration_seconds(dur)
+                    elif val and (
+                        isinstance(val, (int, float, Decimal))
+                        or (isinstance(val, str) and re.match(r"^[\d\.:]+$", val.strip()))
+                    ):
+                        duration_s = _parse_duration_seconds(val)
+
+                    if duration_s is not None and duration_s > 0:
+                        extra_meta: dict[str, Any] = {}
+                        if w_type and isinstance(w_type, str) and w_type.strip():
+                            extra_meta["workout_type"] = w_type.strip()
+                        if i < len(sources) and sources[i]:
+                            extra_meta["device"] = str(sources[i]).strip()
+                        if w_energy is not None:
+                            extra_meta["active_energy_kcal"] = float(w_energy)
+                        items.append(
+                            HealthSampleItem(
+                                measured_at=st,
+                                ended_at=end,
+                                value=duration_s,
+                                sample_type="workout",
                                 unit="s",
                                 source=self.source,
                                 extra=extra_meta,

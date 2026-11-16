@@ -251,6 +251,53 @@ def classify_activity_pattern(
         }
 
 
+_APPLE_WORKOUT_TYPE_MAP: list[tuple[tuple[str, ...], dict[str, str]]] = [
+    (
+        ("badminton",),
+        {"classification": "badminton", "activity_type": "badminton", "routine_name": "Badminton Match Play"},
+    ),
+    (
+        ("tennis", "squash", "racquetball", "pickleball"),
+        {"classification": "badminton", "activity_type": "badminton", "routine_name": "Court Sport"},
+    ),
+    (
+        ("strength", "weightlifting", "weight training", "core training"),
+        {"classification": "gym", "activity_type": "gym", "routine_name": "Resistance Training"},
+    ),
+    (
+        ("hiit", "high intensity", "cross training", "mixed cardio", "circuit", "boxing", "kickboxing", "gym class"),
+        {"classification": "gym", "activity_type": "gym", "routine_name": "Gym Class / HIIT"},
+    ),
+    (
+        ("walk", "hiking"),
+        {"classification": "walk", "activity_type": "walk", "routine_name": "Walk / Cardio"},
+    ),
+    (
+        ("swim",),
+        {"classification": "swim", "activity_type": "swim", "routine_name": "Swimming"},
+    ),
+    (
+        ("run",),
+        {"classification": "run", "activity_type": "run", "routine_name": "Running"},
+    ),
+    (
+        ("cycl", "bik"),
+        {"classification": "cycle", "activity_type": "cycle", "routine_name": "Cycling"},
+    ),
+]
+
+
+def classify_apple_workout_type(workout_type: str | None) -> dict[str, str] | None:
+    """Maps an explicit Apple Health HKWorkout activity type to Eir's classification."""
+    if not workout_type:
+        return None
+    normalized = workout_type.strip().lower()
+    for keywords, mapping in _APPLE_WORKOUT_TYPE_MAP:
+        if any(kw in normalized for kw in keywords):
+            return dict(mapping)
+    return None
+
+
 def estimate_workout_active_calories(
     duration_mins: int,
     avg_hr: int | None,
