@@ -794,6 +794,71 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertIn("z4_threshold_pct", workout["hr_zones"])
         self.assertIn("z5_anaerobic_pct", workout["hr_zones"])
 
+    def test_get_workout_metrics_for_custom_split_window(self):
+        """GET /biometrics/workout-metrics computes full HR zones, TRIMP, RPE, and energy for an arbitrary window."""
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        base_time = dt.datetime(2026, 11, 16, 18, 35, tzinfo=nz_tz)
+
+        for m in range(0, 35, 5):
+            t = base_time + dt.timedelta(minutes=m)
+            t_end = t + dt.timedelta(minutes=5)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=t,
+                    ended_at=t_end,
+                    value=Decimal("22.5"),
+                    unit="kcal",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=t,
+                    ended_at=t_end,
+                    value=Decimal(str(130 + (m % 15))),
+                    unit="bpm",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=t,
+                    ended_at=t_end,
+                    value=Decimal("150"),
+                    unit="count",
+                )
+            )
+        self.db.commit()
+
+        res = self.client.get(
+            "/biometrics/workout-metrics",
+            params={
+                "started_at": base_time.isoformat(),
+                "ended_at": (base_time + dt.timedelta(minutes=35)).isoformat(),
+                "classification": "gym",
+                "routine_name": "Lower Body A - Squat Emphasis (MEV Deload)",
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["duration_minutes"], 35)
+        self.assertEqual(data["classification"], "gym")
+        self.assertEqual(data["routine_name"], "Lower Body A - Squat Emphasis (MEV Deload)")
+        self.assertEqual(data["active_energy_kcal"], 158)
+        self.assertEqual(data["step_count"], 1050)
+        self.assertIsNotNone(data["hr_zones"])
+        self.assertGreater(data["trimp"], 0.0)
+        self.assertGreaterEqual(data["rpe"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
