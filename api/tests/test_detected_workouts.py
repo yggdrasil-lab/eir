@@ -859,6 +859,67 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertGreater(data["trimp"], 0.0)
         self.assertGreaterEqual(data["rpe"], 1.0)
 
+    def test_detected_workouts_badminton_with_cooldown_hr_tail(self):
+        target_d = dt.date(2026, 11, 19)
+        base_time = dt.datetime(2026, 11, 19, 20, 15, tzinfo=dt.timezone.utc)
+
+        # 85 minutes total (17 intervals): 50 min of court rallies (4 burst slots >= 250 steps)
+        # followed by 35 min post-match elevated HR cooldown tail with minimal steps,
+        # diluting overall cadence to ~27.1 steps/min (just under 28.0).
+        slot_pattern_steps = [437, 0, 131, 474, 0, 571, 0, 329, 0, 203, 157, 0, 0, 159, 0, 0, 0]
+        slot_pattern_hrs = [110, 160, 155, 148, 160, 166, 162, 159, 166, 153, 120, 123, 115, 123, 120, 113, 136]
+        slot_pattern_energies = [0, 16, 0, 14, 0, 20, 0, 11, 0, 10, 0, 0, 0, 9, 0, 0, 0]
+
+        for i, (steps, hr_val, energy) in enumerate(zip(slot_pattern_steps, slot_pattern_hrs, slot_pattern_energies)):
+            t = base_time + dt.timedelta(minutes=i * 5)
+            if energy > 0:
+                self.db.add(
+                    HealthSample(
+                        id=uuid.uuid4(),
+                        source="apple_health",
+                        sample_type="active_energy",
+                        measured_at=t,
+                        ended_at=t + dt.timedelta(minutes=5),
+                        value=Decimal(str(energy)),
+                        unit="kcal",
+                    )
+                )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal(str(hr_val)),
+                    unit="bpm",
+                )
+            )
+            if steps > 0:
+                self.db.add(
+                    HealthSample(
+                        id=uuid.uuid4(),
+                        source="apple_health",
+                        sample_type="step_count",
+                        measured_at=t,
+                        ended_at=t + dt.timedelta(minutes=5),
+                        value=Decimal(str(steps)),
+                        unit="count",
+                    )
+                )
+
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data), 1)
+        workout = data[0]
+        self.assertEqual(workout["duration_minutes"], 85)
+        self.assertEqual(workout["classification"], "badminton")
+        self.assertEqual(workout["activity_type"], "badminton")
+        self.assertEqual(workout["routine_name"], "Badminton Match Play")
+
 
 if __name__ == "__main__":
     unittest.main()
