@@ -189,6 +189,7 @@ def classify_activity_pattern(
     # - sustained active court movement:
     #   * cadence >= 40 steps/min, OR
     #   * cadence >= 28 steps/min with burst slots (>= 2 slots with >= 250 steps), OR
+    #   * cadence >= 22 steps/min with repeated court bursts (>= 3 burst slots, tolerates post-match cooldown HR tail), OR
     #   * cadence >= 32 steps/min with rest break intervals (game-rest-game pattern)
     # - excludes gym workouts with warmup jog and swimming
     is_badminton = (
@@ -197,6 +198,7 @@ def classify_activity_pattern(
         and (
             cadence >= 40.0
             or (cadence >= 28.0 and burst_slots >= 2)
+            or (cadence >= 22.0 and burst_slots >= 3)
             or (cadence >= 32.0 and has_rest_break_interval)
         )
         and ((avg_hr is not None and avg_hr >= 125) or (peak_hr is not None and peak_hr >= 140))
