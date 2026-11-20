@@ -920,6 +920,225 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertEqual(workout["activity_type"], "badminton")
         self.assertEqual(workout["routine_name"], "Badminton Match Play")
 
+    def test_detected_workouts_cross_slot_step_dedup_resistance_not_badminton(self):
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        target_d = dt.date(2026, 11, 20)
+        workout_start = dt.datetime(2026, 11, 20, 16, 55, tzinfo=nz_tz)
+
+        # Replay 2026-11-20 Lower Body A (16:55-17:35 NZDT): avg_hr=115, peak_hr=140, 172 kcal
+        slot_hrs = [112, 120, 102, 140, 118, 104, 124, 100]
+        slot_energies = [22, 22, 22, 22, 21, 21, 21, 21]
+        for i, (hr_val, energy_val) in enumerate(zip(slot_hrs, slot_energies)):
+            t = workout_start + dt.timedelta(minutes=i * 5)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal(str(energy_val)),
+                    unit="kcal",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal(str(hr_val)),
+                    unit="bpm",
+                )
+            )
+
+        # Staggered Watch vs overlapping iPhone step intervals across adjacent 5-min slots
+        watch_steps = [
+            (dt.datetime(2026, 11, 20, 16, 53, 46, tzinfo=nz_tz), dt.datetime(2026, 11, 20, 17, 3, 27, tzinfo=nz_tz), 619),
+            (dt.datetime(2026, 11, 20, 17, 3, 45, tzinfo=nz_tz), dt.datetime(2026, 11, 20, 17, 13, 44, tzinfo=nz_tz), 222),
+            (dt.datetime(2026, 11, 20, 17, 13, 44, tzinfo=nz_tz), dt.datetime(2026, 11, 20, 17, 23, 34, tzinfo=nz_tz), 610),
+            (dt.datetime(2026, 11, 20, 17, 24, 25, tzinfo=nz_tz), dt.datetime(2026, 11, 20, 17, 33, 46, tzinfo=nz_tz), 132),
+        ]
+        phone_steps = [
+            (dt.datetime(2026, 11, 20, 16, 56, 1, tzinfo=nz_tz), dt.datetime(2026, 11, 20, 17, 5, 24, tzinfo=nz_tz), 325),
+            (dt.datetime(2026, 11, 20, 17, 6, 25, tzinfo=nz_tz), dt.datetime(2026, 11, 20, 17, 16, 19, tzinfo=nz_tz), 232),
+            (dt.datetime(2026, 11, 20, 17, 16, 19, tzinfo=nz_tz), dt.datetime(2026, 11, 20, 17, 25, 37, tzinfo=nz_tz), 697),
+        ]
+        for s_dt, e_dt, val in watch_steps:
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=s_dt,
+                    ended_at=e_dt,
+                    value=Decimal(str(val)),
+                    unit="count",
+                    extra={"device": "Raymund's Apple Watch"},
+                )
+            )
+        for s_dt, e_dt, val in phone_steps:
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=s_dt,
+                    ended_at=e_dt,
+                    value=Decimal(str(val)),
+                    unit="count",
+                    extra={"device": "Raymund's iPhone"},
+                )
+            )
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data), 1)
+        workout = data[0]
+        self.assertEqual(workout["duration_minutes"], 40)
+        self.assertEqual(workout["classification"], "gym")
+        self.assertEqual(workout["routine_name"], "Resistance Training")
+        self.assertEqual(workout["step_count"], 964)
+        self.assertEqual(workout["avg_hr_bpm"], 115)
+        self.assertEqual(workout["peak_hr_bpm"], 140)
+
+        # Window metrics endpoint must also deduplicate across slots consistently
+        win_res = self.client.get(
+            "/biometrics/workout-metrics",
+            params={
+                "started_at": workout_start.isoformat(),
+                "ended_at": (workout_start + dt.timedelta(minutes=40)).isoformat(),
+            },
+        )
+        self.assertEqual(win_res.status_code, 200)
+        win_data = win_res.json()
+        self.assertEqual(win_data["classification"], "gym")
+        self.assertEqual(win_data["step_count"], 964)
+
+    def test_detected_workouts_moderate_hr_resistance_not_badminton(self):
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        target_d = dt.date(2026, 11, 15)
+        base_time = dt.datetime(2026, 11, 15, 15, 50, tzinfo=nz_tz)
+
+        # 60 min Lower Body B pattern: avg_hr=126, peak_hr=151, cadence=48 steps/min (6 burst slots)
+        slot_hrs = [151, 120, 130, 118, 128, 115, 132, 118, 130, 116, 134, 120]
+        slot_steps = [280, 200, 280, 200, 280, 200, 280, 200, 280, 200, 280, 200]
+        for i, (hr_val, steps_val) in enumerate(zip(slot_hrs, slot_steps)):
+            t = base_time + dt.timedelta(minutes=i * 5)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal("22.5"),
+                    unit="kcal",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal(str(hr_val)),
+                    unit="bpm",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal(str(steps_val)),
+                    unit="count",
+                    extra={"device": "Raymund's Apple Watch"},
+                )
+            )
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data), 1)
+        workout = data[0]
+        self.assertEqual(workout["duration_minutes"], 60)
+        self.assertEqual(workout["avg_hr_bpm"], 126)
+        self.assertEqual(workout["peak_hr_bpm"], 151)
+        self.assertEqual(workout["step_count"], 2880)
+        self.assertEqual(workout["classification"], "gym")
+        self.assertEqual(workout["routine_name"], "Resistance Training")
+
+    def test_detected_workouts_brisk_walk_hr_spike_not_badminton(self):
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        target_d = dt.date(2026, 11, 5)
+        base_time = dt.datetime(2026, 11, 5, 12, 30, tzinfo=nz_tz)
+
+        # 40 min brisk walk pattern: avg_hr=120, peak_hr=146, cadence=74 steps/min
+        slot_hrs = [112, 116, 118, 146, 120, 116, 118, 114]
+        for i, hr_val in enumerate(slot_hrs):
+            t = base_time + dt.timedelta(minutes=i * 5)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="active_energy",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal("23.5"),
+                    unit="kcal",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal(str(hr_val)),
+                    unit="bpm",
+                )
+            )
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=t,
+                    ended_at=t + dt.timedelta(minutes=5),
+                    value=Decimal("370"),
+                    unit="count",
+                    extra={"device": "Raymund's Apple Watch"},
+                )
+            )
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/detected-workouts?target_date={target_d.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(len(data), 1)
+        workout = data[0]
+        self.assertEqual(workout["duration_minutes"], 40)
+        self.assertEqual(workout["avg_hr_bpm"], 120)
+        self.assertEqual(workout["peak_hr_bpm"], 146)
+        self.assertEqual(workout["step_count"], 2960)
+        self.assertEqual(workout["classification"], "walk")
+        self.assertEqual(workout["routine_name"], "Walk / Cardio")
+
 
 if __name__ == "__main__":
     unittest.main()

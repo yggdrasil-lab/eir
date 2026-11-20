@@ -29,6 +29,51 @@ def _to_utc_dt(val: str | datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _is_confirmed_session(session: dict[str, Any]) -> bool:
+    """Returns True if a Kratos session is user-confirmed or manually logged."""
+    extra = session.get("extra") or {}
+    return (
+        extra.get("confirmed") is True
+        or extra.get("inferred") is False
+        or session.get("routine_id") is not None
+        or len(session.get("items") or []) > 0
+    )
+
+
+def _cleanup_stale_inferred_duplicates(
+    http_client: httpx.Client,
+    base_url: str,
+    overlapping_inferred_ids: list[str],
+    target_id: str,
+    existing_sessions: list[dict[str, Any]],
+) -> None:
+    """Deletes stale inferred duplicate sessions after matching a confirmed session."""
+    deleted_ids: set[str] = set()
+    for dup_id in overlapping_inferred_ids:
+        if dup_id == target_id:
+            continue
+        try:
+            del_resp = http_client.delete(f"{base_url}/sessions/{dup_id}")
+            if del_resp.status_code in (200, 204, 404):
+                deleted_ids.add(dup_id)
+            else:
+                logger.warning(
+                    "Unexpected status %s deleting stale inferred Kratos session %s",
+                    del_resp.status_code,
+                    dup_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to delete stale inferred Kratos session %s: %s",
+                dup_id,
+                exc,
+            )
+    if deleted_ids:
+        existing_sessions[:] = [
+            s for s in existing_sessions if str(s.get("id") or "") not in deleted_ids
+        ]
+
+
 def sync_detected_workouts_to_kratos(
     workouts: list[DetectedWorkoutRead],
     kratos_url: str | None = None,
@@ -79,15 +124,29 @@ def sync_detected_workouts_to_kratos(
             w_start_utc = _to_utc_dt(w.started_at)
             w_end_utc = _to_utc_dt(w.ended_at)
 
-            # Find matching or overlapping session in Kratos
-            matched_session: dict[str, Any] | None = None
-            max_overlap_s = 0.0
+            # Full scan: prefer confirmed sessions over stale inferred matches and track overlapping inferred IDs
+            best_confirmed: dict[str, Any] | None = None
+            exact_confirmed_matched = False
+            max_confirmed_overlap = 0.0
+            exact_inferred: dict[str, Any] | None = None
+            best_inferred: dict[str, Any] | None = None
+            max_inferred_overlap = 0.0
+            overlapping_inferred_ids: list[str] = []
 
             for s in existing_sessions:
                 s_id = s.get("id")
-                if s_id and str(s_id) == str(session_id):
-                    matched_session = s
-                    break
+                s_id_str = str(s_id) if s_id else None
+                s_confirmed = _is_confirmed_session(s)
+
+                if s_id_str and s_id_str == str(session_id):
+                    if s_confirmed:
+                        best_confirmed = s
+                        exact_confirmed_matched = True
+                    else:
+                        exact_inferred = s
+                        if s_id_str not in overlapping_inferred_ids:
+                            overlapping_inferred_ids.append(s_id_str)
+                    continue
 
                 s_start_raw = s.get("started_at")
                 if not s_start_raw:
@@ -102,11 +161,22 @@ def sync_detected_workouts_to_kratos(
                         s_end_utc = s_start_utc + timedelta(minutes=dur)
 
                     overlap = (min(w_end_utc, s_end_utc) - max(w_start_utc, s_start_utc)).total_seconds()
-                    if overlap > max_overlap_s:
-                        max_overlap_s = overlap
-                        matched_session = s
                 except Exception:
                     continue
+
+                if overlap > 0:
+                    if s_confirmed:
+                        if not exact_confirmed_matched and overlap > max_confirmed_overlap:
+                            max_confirmed_overlap = overlap
+                            best_confirmed = s
+                    else:
+                        if s_id_str and s_id_str not in overlapping_inferred_ids:
+                            overlapping_inferred_ids.append(s_id_str)
+                        if overlap > max_inferred_overlap:
+                            max_inferred_overlap = overlap
+                            best_inferred = s
+
+            matched_session = best_confirmed or exact_inferred or best_inferred
 
             # Fallback direct lookup by deterministic UUID if not found in list
             if matched_session is None:
@@ -119,12 +189,7 @@ def sync_detected_workouts_to_kratos(
             if matched_session is not None:
                 target_id = str(matched_session.get("id") or session_id)
                 existing_extra = dict(matched_session.get("extra") or {})
-                is_confirmed = (
-                    existing_extra.get("confirmed") is True
-                    or existing_extra.get("inferred") is False
-                    or matched_session.get("routine_id") is not None
-                    or len(matched_session.get("items") or []) > 0
-                )
+                is_confirmed = _is_confirmed_session(matched_session)
 
                 # If already reconciled and confirmed with complete exertion telemetry, skip redundant writes
                 if (
@@ -134,6 +199,14 @@ def sync_detected_workouts_to_kratos(
                     and "rpe" in existing_extra
                     and (existing_extra.get("active_energy_kcal") or 0) >= w.active_energy_kcal
                 ):
+                    if best_confirmed is not None and overlapping_inferred_ids:
+                        _cleanup_stale_inferred_duplicates(
+                            http_client,
+                            base_url,
+                            overlapping_inferred_ids,
+                            target_id,
+                            existing_sessions,
+                        )
                     logger.info(
                         "Skipping Kratos session %s: already confirmed and telemetry reconciled",
                         target_id,
@@ -191,6 +264,15 @@ def sync_detected_workouts_to_kratos(
                 }
                 put_resp = http_client.put(f"{base_url}/sessions/{target_id}", json=reconciled_payload)
                 put_resp.raise_for_status()
+
+                if best_confirmed is not None and overlapping_inferred_ids:
+                    _cleanup_stale_inferred_duplicates(
+                        http_client,
+                        base_url,
+                        overlapping_inferred_ids,
+                        target_id,
+                        existing_sessions,
+                    )
 
                 status_label = "reconciled" if is_confirmed else "synced"
                 logger.info(
