@@ -138,7 +138,14 @@ class TestKratosSync(unittest.TestCase):
         mock_check.status_code = 200
         mock_check.json.return_value = {
             "id": str(generate_session_id(w.started_at.isoformat(), w.ended_at.isoformat())),
-            "extra": {"confirmed": True, "inferred": False, "telemetry_reconciled": True},
+            "extra": {
+                "confirmed": True,
+                "inferred": False,
+                "telemetry_reconciled": True,
+                "hr_zones": {"z4_threshold_pct": 35.0},
+                "rpe": 8.5,
+                "active_energy_kcal": 450,
+            },
         }
         mock_http.get.return_value = mock_check
 
@@ -249,6 +256,85 @@ class TestKratosSync(unittest.TestCase):
         self.assertEqual(put_body["extra"]["active_energy_kcal"], 500)
         self.assertEqual(put_body["extra"]["step_count"], 2000)
         self.assertTrue(put_body["extra"]["telemetry_reconciled"])
+
+    def test_sync_detected_workouts_prefers_confirmed_over_stale_inferred_duplicate(self):
+        w = DetectedWorkoutRead(
+            started_at=datetime(2026, 11, 20, 16, 55, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 11, 20, 17, 35, tzinfo=timezone.utc),
+            duration_minutes=40,
+            active_energy_kcal=172,
+            avg_hr_bpm=115,
+            peak_hr_bpm=140,
+            step_count=964,
+            confidence="medium",
+            classification="gym",
+            activity_type="gym",
+            routine_name="Resistance Training",
+        )
+
+        inferred_id = str(generate_session_id(w.started_at.isoformat(), w.ended_at.isoformat()))
+        confirmed_id = str(uuid.uuid4())
+        mock_http = MagicMock(spec=httpx.Client)
+
+        def mock_get(url, **kwargs):
+            resp = MagicMock()
+            if url.endswith("/sessions"):
+                resp.status_code = 200
+                resp.json.return_value = [
+                    {
+                        "id": inferred_id,
+                        "started_at": w.started_at.isoformat(),
+                        "ended_at": w.ended_at.isoformat(),
+                        "routine_id": None,
+                        "extra": {
+                            "inferred": True,
+                            "classification": "badminton",
+                            "routine_name": "Badminton Match Play",
+                        },
+                        "items": [],
+                    },
+                    {
+                        "id": confirmed_id,
+                        "started_at": "2026-11-20T17:04:00+00:00",
+                        "ended_at": "2026-11-20T18:03:00+00:00",
+                        "notes": "Lower Body A",
+                        "routine_id": str(uuid.uuid4()),
+                        "extra": {
+                            "confirmed": True,
+                            "inferred": False,
+                            "routine_name": "Lower Body A",
+                        },
+                        "items": [{"exercise_id": str(uuid.uuid4())}],
+                    },
+                ]
+            else:
+                resp.status_code = 404
+            return resp
+
+        mock_http.get.side_effect = mock_get
+        mock_put = MagicMock()
+        mock_put.status_code = 200
+        mock_http.put.return_value = mock_put
+        mock_del = MagicMock()
+        mock_del.status_code = 204
+        mock_http.delete.return_value = mock_del
+
+        results = sync_detected_workouts_to_kratos([w], kratos_url="http://kratos-api:8000", client=mock_http)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "reconciled")
+        self.assertEqual(results[0]["session_id"], confirmed_id)
+
+        self.assertEqual(mock_http.put.call_count, 1)
+        put_url = mock_http.put.call_args[0][0]
+        self.assertTrue(put_url.endswith(f"/sessions/{confirmed_id}"))
+        put_body = mock_http.put.call_args[1]["json"]
+        self.assertEqual(put_body["extra"]["active_energy_kcal"], 172)
+        self.assertEqual(put_body["extra"]["step_count"], 964)
+        self.assertTrue(put_body["extra"]["telemetry_reconciled"])
+
+        self.assertEqual(mock_http.delete.call_count, 1)
+        del_url = mock_http.delete.call_args[0][0]
+        self.assertTrue(del_url.endswith(f"/sessions/{inferred_id}"))
 
     def test_apple_health_ingest_runs_detection_and_sync(self):
         target_date = date(2026, 11, 11)

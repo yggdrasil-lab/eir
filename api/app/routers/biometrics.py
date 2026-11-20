@@ -23,6 +23,7 @@ from app.services.biometrics import (
     compute_workout_exertion_metrics,
     deduplicate_step_samples,
     estimate_workout_active_calories,
+    filter_deduplicated_step_samples,
 )
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
@@ -173,7 +174,8 @@ def compute_workout_metrics_for_window(
         if s.sample_type in ("step_count", "steps")
         and s_time <= _sample_local_dt(s) < e_time
     ]
-    block_steps = deduplicate_step_samples(step_samples)
+    deduped_step_samples = filter_deduplicated_step_samples(step_samples)
+    block_steps = sum((s.value for s in deduped_step_samples), Decimal(0))
     avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
     peak_hr = int(round(max(all_hrs))) if all_hrs else None
 
@@ -201,8 +203,9 @@ def compute_workout_metrics_for_window(
         for i in range(num_slots):
             slot_s = s_time + timedelta(minutes=i * 5)
             slot_e = slot_s + timedelta(minutes=5)
-            slot_steps[i] = deduplicate_step_samples(
-                [x for x in step_samples if slot_s <= _sample_local_dt(x) < slot_e]
+            slot_steps[i] = sum(
+                (x.value for x in deduped_step_samples if slot_s <= _sample_local_dt(x) < slot_e),
+                Decimal(0),
             )
         slot_hrs = [(sum(h) / len(h)) if h else None for h in slot_hr_lists]
         pattern = classify_activity_pattern(
@@ -253,10 +256,16 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
     if not samples:
         return []
 
+    # Pre-deduplicate all day step samples once before bucketing into 5-minute slots
+    # so Watch samples in adjacent slots cleanly suppress overlapping iPhone samples.
+    deduped_step_samples = filter_deduplicated_step_samples(
+        [s for s in samples if s.sample_type in ("step_count", "steps")]
+    )
+
     # Partition 24 hours into 288 5-minute slots for exertion thresholding
     slots = [{"energy": Decimal(0), "hr_vals": [], "step_samples": []} for _ in range(288)]
     for s in samples:
-        dt = s.measured_at.astimezone(settings.tz) if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=settings.tz)
+        dt = _sample_local_dt(s)
         offset = (dt - start_dt).total_seconds()
         idx = int(offset // 300)
         if 0 <= idx < 288:
@@ -264,13 +273,17 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                 slots[idx]["energy"] += s.value
             elif s.sample_type in ("heart_rate", "resting_hr"):
                 slots[idx]["hr_vals"].append(float(s.value))
-            elif s.sample_type in ("step_count", "steps"):
-                slots[idx]["step_samples"].append(s)
+    for s in deduped_step_samples:
+        dt = _sample_local_dt(s)
+        offset = (dt - start_dt).total_seconds()
+        idx = int(offset // 300)
+        if 0 <= idx < 288:
+            slots[idx]["step_samples"].append(s)
 
     active_indices = []
     for i, slot in enumerate(slots):
         avg_hr = (sum(slot["hr_vals"]) / len(slot["hr_vals"])) if slot["hr_vals"] else None
-        slot_step_val = deduplicate_step_samples(slot["step_samples"]) if slot["step_samples"] else Decimal(0)
+        slot_step_val = sum((s.value for s in slot["step_samples"]), Decimal(0))
         # Exertion threshold: >= 20 kcal in 5m (~4 kcal/min), avg HR >= 120 bpm, cadence >= 250 steps/5m with avg HR >= 95 bpm, or gym exertion (energy >= 15 kcal with HR >= 100 bpm)
         is_active = (
             (slot["energy"] >= Decimal(20))
@@ -297,17 +310,13 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
         gap_has_transit_walk = False
 
         curr_total_steps = sum(
-            deduplicate_step_samples(slots[c]["step_samples"]) if slots[c]["step_samples"] else Decimal(0)
-            for c in curr
+            (sum((s.value for s in slots[c]["step_samples"]), Decimal(0)) for c in curr),
+            Decimal(0),
         )
         curr_cadence = float(curr_total_steps) / (len(curr) * 5) if curr else 0.0
 
         for g_idx in range(curr[-1] + 1, idx):
-            g_steps = (
-                deduplicate_step_samples(slots[g_idx]["step_samples"])
-                if slots[g_idx]["step_samples"]
-                else Decimal(0)
-            )
+            g_steps = sum((s.value for s in slots[g_idx]["step_samples"]), Decimal(0))
             if g_steps < Decimal(50):
                 consecutive_stationary += 1
                 if consecutive_stationary >= 2:  # 2 slots * 5 min = 10 min
@@ -346,11 +355,7 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
                 else None
             )
             slot_hrs.append(s_hr)
-            s_steps = (
-                deduplicate_step_samples(slots[i]["step_samples"])
-                if slots[i]["step_samples"]
-                else Decimal(0)
-            )
+            s_steps = sum((s.value for s in slots[i]["step_samples"]), Decimal(0))
             slot_steps.append(s_steps)
             slot_energies.append(slots[i]["energy"])
 
@@ -359,13 +364,14 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
 
         s_time = start_dt + timedelta(minutes=start_idx * 5)
         e_time = start_dt + timedelta(minutes=(end_idx + 1) * 5)
-        # Centralized multi-device step deduplication for the workout window
-        cluster_steps = [
-            s for s in samples
-            if s.sample_type in ("step_count", "steps")
-            and s_time <= (s.measured_at.astimezone(settings.tz) if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=settings.tz)) < e_time
-        ]
-        block_steps = deduplicate_step_samples(cluster_steps)
+        block_steps = sum(
+            (
+                s.value
+                for s in deduped_step_samples
+                if s_time <= _sample_local_dt(s) < e_time
+            ),
+            Decimal(0),
+        )
 
         # Filter noise:
         # 1. High-intensity workout: >= 30 mins AND (energy >= 250 kcal OR avg HR >= 120)
