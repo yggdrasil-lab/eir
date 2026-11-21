@@ -226,7 +226,7 @@ def sync_detected_workouts_to_kratos(
                     existing_extra["peak_hr"] = w.peak_hr_bpm
                 if w.step_count is not None:
                     existing_extra["step_count"] = w.step_count
-                if w.effort_rating:
+                if w.effort_rating and not existing_extra.get("effort_rating"):
                     existing_extra["effort_rating"] = w.effort_rating
                 if w.rpe is not None:
                     existing_extra["rpe"] = w.rpe
