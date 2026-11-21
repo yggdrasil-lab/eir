@@ -204,6 +204,98 @@ class TestKratosSync(unittest.TestCase):
         self.assertTrue(put_kwargs["extra"]["telemetry_reconciled"])
         self.assertEqual(len(put_kwargs["items"]), 1)
 
+    def test_sync_detected_workouts_preserves_existing_effort_rating(self):
+        w = DetectedWorkoutRead(
+            started_at=datetime(2026, 11, 20, 9, 0, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc),
+            duration_minutes=60,
+            active_energy_kcal=310,
+            avg_hr_bpm=118,
+            peak_hr_bpm=134,
+            step_count=1800,
+            confidence="high",
+            classification="gym",
+            activity_type="gym",
+            routine_name="Upper Body A",
+            effort_rating="too_easy",
+            rpe=6.0,
+            trimp=95.0,
+        )
+
+        session_id = str(generate_session_id(w.started_at.isoformat(), w.ended_at.isoformat()))
+        mock_http = MagicMock(spec=httpx.Client)
+        mock_list = MagicMock()
+        mock_list.status_code = 200
+        mock_list.json.return_value = [
+            {
+                "id": session_id,
+                "started_at": w.started_at.isoformat(),
+                "ended_at": w.ended_at.isoformat(),
+                "routine_id": str(uuid.uuid4()),
+                "extra": {"confirmed": True, "inferred": False, "effort_rating": "optimal"},
+                "notes": "Manual PWA debrief rating",
+                "items": [{"id": str(uuid.uuid4()), "sets": []}],
+            }
+        ]
+        mock_http.get.return_value = mock_list
+
+        mock_put = MagicMock()
+        mock_put.status_code = 200
+        mock_http.put.return_value = mock_put
+
+        results = sync_detected_workouts_to_kratos([w], kratos_url="http://kratos-api:8000", client=mock_http)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "reconciled")
+        self.assertEqual(mock_http.put.call_count, 1)
+        put_kwargs = mock_http.put.call_args[1]["json"]
+        self.assertEqual(put_kwargs["extra"]["effort_rating"], "optimal")
+        self.assertEqual(put_kwargs["extra"]["active_energy_kcal"], 310)
+        self.assertTrue(put_kwargs["extra"]["telemetry_reconciled"])
+
+    def test_sync_detected_workouts_populates_null_effort_rating(self):
+        w = DetectedWorkoutRead(
+            started_at=datetime(2026, 11, 20, 11, 0, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc),
+            duration_minutes=60,
+            active_energy_kcal=420,
+            avg_hr_bpm=140,
+            peak_hr_bpm=158,
+            step_count=4500,
+            confidence="high",
+            classification="badminton",
+            activity_type="badminton",
+            routine_name="Badminton Match Play",
+            effort_rating="hard",
+        )
+
+        session_id = str(generate_session_id(w.started_at.isoformat(), w.ended_at.isoformat()))
+        mock_http = MagicMock(spec=httpx.Client)
+        mock_list = MagicMock()
+        mock_list.status_code = 200
+        mock_list.json.return_value = [
+            {
+                "id": session_id,
+                "started_at": w.started_at.isoformat(),
+                "ended_at": w.ended_at.isoformat(),
+                "routine_id": None,
+                "extra": {"confirmed": True, "inferred": False, "effort_rating": None},
+                "notes": None,
+                "items": [],
+            }
+        ]
+        mock_http.get.return_value = mock_list
+
+        mock_put = MagicMock()
+        mock_put.status_code = 200
+        mock_http.put.return_value = mock_put
+
+        results = sync_detected_workouts_to_kratos([w], kratos_url="http://kratos-api:8000", client=mock_http)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "reconciled")
+        self.assertEqual(mock_http.put.call_count, 1)
+        put_kwargs = mock_http.put.call_args[1]["json"]
+        self.assertEqual(put_kwargs["extra"]["effort_rating"], "hard")
+
     def test_sync_detected_workouts_overlap_guard_deduplication(self):
         w = DetectedWorkoutRead(
             started_at=datetime(2026, 11, 11, 9, 0, tzinfo=timezone.utc),
