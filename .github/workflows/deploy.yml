@@ -13,10 +13,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate Required Configuration
+        env:
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_RAW_PASSWORD: ${{ secrets.REGISTRY_RAW_PASSWORD }}
+          EIR_MCP_TOKEN: ${{ secrets.EIR_MCP_TOKEN }}
+          EIR_WITHINGS_CLIENT_ID: ${{ secrets.EIR_WITHINGS_CLIENT_ID }}
+          EIR_WITHINGS_CLIENT_SECRET: ${{ secrets.EIR_WITHINGS_CLIENT_SECRET }}
+        run: |
+          MISSING=""
+          [ -z "$DOMAIN_NAME" ] && MISSING="${MISSING:+$MISSING }DOMAIN_NAME"
+          [ -z "$REGISTRY_PREFIX" ] && MISSING="${MISSING:+$MISSING }REGISTRY_PREFIX"
+          [ -z "$REGISTRY_USERNAME" ] && MISSING="${MISSING:+$MISSING }REGISTRY_USERNAME"
+          [ -z "$REGISTRY_RAW_PASSWORD" ] && MISSING="${MISSING:+$MISSING }REGISTRY_RAW_PASSWORD"
+          [ -z "$EIR_MCP_TOKEN" ] && MISSING="${MISSING:+$MISSING }EIR_MCP_TOKEN"
+          [ -z "$EIR_WITHINGS_CLIENT_ID" ] && MISSING="${MISSING:+$MISSING }EIR_WITHINGS_CLIENT_ID"
+          [ -z "$EIR_WITHINGS_CLIENT_SECRET" ] && MISSING="${MISSING:+$MISSING }EIR_WITHINGS_CLIENT_SECRET"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing required configuration: $MISSING" >&2
+            exit 1
+          fi
+
       - name: Log in to Registry
         uses: docker/login-action@v3
         with:
-          registry: registry.tienzo.net
+          registry: registry.${{ vars.DOMAIN_NAME }}
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_RAW_PASSWORD }}
 
@@ -34,19 +57,18 @@ jobs:
 
       - name: Prepare host data directory
         env:
-          EIR_DB_MOUNT_PATH: ${{ vars.EIR_DB_MOUNT_PATH }}
+          EIR_DB_MOUNT_PATH: ${{ vars.EIR_DB_MOUNT_PATH || '/opt/eir/data' }}
         run: |
-          DB_DIR="${EIR_DB_MOUNT_PATH:-/opt/eir/data}"
-          docker run --rm -v "${DB_DIR}":/data alpine mkdir -p /data
+          docker run --rm -v "${EIR_DB_MOUNT_PATH}":/data alpine mkdir -p /data
 
       - name: Build and Deploy with Docker Compose
         env:
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
           EIR_DB_MOUNT_PATH: ${{ vars.EIR_DB_MOUNT_PATH || '/opt/eir/data' }}
-          EIR_WITHINGS_CLIENT_ID: ${{ secrets.EIR_WITHINGS_CLIENT_ID || vars.EIR_WITHINGS_CLIENT_ID || '' }}
-          EIR_WITHINGS_CLIENT_SECRET: ${{ secrets.EIR_WITHINGS_CLIENT_SECRET || '' }}
-          EIR_WITHINGS_REDIRECT_URI: ${{ secrets.EIR_WITHINGS_REDIRECT_URI || vars.EIR_WITHINGS_REDIRECT_URI || '' }}
+          EIR_WITHINGS_CLIENT_ID: ${{ secrets.EIR_WITHINGS_CLIENT_ID }}
+          EIR_WITHINGS_CLIENT_SECRET: ${{ secrets.EIR_WITHINGS_CLIENT_SECRET }}
+          EIR_WITHINGS_REDIRECT_URI: https://eir.${{ vars.DOMAIN_NAME }}/integrations/withings/callback
           IMAGE_TAG: eir
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh
