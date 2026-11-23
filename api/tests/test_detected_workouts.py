@@ -1139,6 +1139,275 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertEqual(workout["classification"], "walk")
         self.assertEqual(workout["routine_name"], "Walk / Cardio")
 
+    def _add_bin_samples(
+        self,
+        bin_start: dt.datetime,
+        *,
+        hr_values: list[int],
+        energy_kcal: Decimal,
+        watch_steps: int = 0,
+        phone_steps: int = 0,
+    ) -> None:
+        """Seeds granular samples inside a single 5-minute window."""
+        bin_end = bin_start + dt.timedelta(minutes=5)
+        self.db.add(
+            HealthSample(
+                id=uuid.uuid4(),
+                source="apple_health",
+                sample_type="active_energy",
+                measured_at=bin_start,
+                ended_at=bin_end,
+                value=energy_kcal,
+                unit="kcal",
+            )
+        )
+        for idx, hr in enumerate(hr_values):
+            offset_s = min(295, idx * 10)
+            t = bin_start + dt.timedelta(seconds=offset_s)
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="heart_rate",
+                    measured_at=t,
+                    ended_at=t,
+                    value=Decimal(str(hr)),
+                    unit="bpm",
+                )
+            )
+        if watch_steps > 0:
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=bin_start,
+                    ended_at=bin_end,
+                    value=Decimal(str(watch_steps)),
+                    unit="count",
+                    extra={"device": "Alex's Apple Watch"},
+                )
+            )
+        if phone_steps > 0:
+            self.db.add(
+                HealthSample(
+                    id=uuid.uuid4(),
+                    source="apple_health",
+                    sample_type="step_count",
+                    measured_at=bin_start + dt.timedelta(seconds=5),
+                    ended_at=bin_end - dt.timedelta(seconds=5),
+                    value=Decimal(str(phone_steps)),
+                    unit="count",
+                    extra={"device": "Alex's iPhone"},
+                )
+            )
+
+    def test_get_workout_timeline_rejects_invalid_window(self):
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        t = dt.datetime(2026, 11, 23, 17, 30, tzinfo=nz_tz)
+        res = self.client.get(
+            "/biometrics/workout-timeline",
+            params={"started_at": t.isoformat(), "ended_at": t.isoformat()},
+        )
+        self.assertEqual(res.status_code, 400)
+
+    def test_get_workout_timeline_detects_passive_to_active_transition(self):
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        start = dt.datetime(2026, 11, 23, 17, 30, tzinfo=nz_tz)
+        end = start + dt.timedelta(minutes=70)
+
+        for i in range(6):
+            self._add_bin_samples(
+                start + dt.timedelta(minutes=i * 5),
+                hr_values=[140, 144],
+                energy_kcal=Decimal("30"),
+                watch_steps=80,
+                phone_steps=110,
+            )
+        for i in range(6, 14):
+            self._add_bin_samples(
+                start + dt.timedelta(minutes=i * 5),
+                hr_values=[126 + (k % 8) for k in range(18)],
+                energy_kcal=Decimal("25"),
+                watch_steps=120,
+            )
+        self.db.commit()
+
+        res = self.client.get(
+            "/biometrics/workout-timeline",
+            params={"started_at": start.isoformat(), "ended_at": end.isoformat()},
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["duration_minutes"], 70)
+        self.assertEqual(len(data["bins"]), 14)
+
+        self.assertFalse(data["bins"][0]["is_active_watch_mode"])
+        self.assertEqual(data["bins"][0]["hr_sample_count"], 2)
+        self.assertEqual(data["bins"][0]["step_count"], 80)
+        self.assertEqual(data["bins"][0]["active_energy_kcal"], 30)
+
+        self.assertTrue(data["bins"][6]["is_active_watch_mode"])
+        self.assertEqual(data["bins"][6]["hr_sample_count"], 18)
+        self.assertEqual(data["bins"][6]["step_count"], 120)
+
+        self.assertEqual(len(data["suggested_splits"]), 1)
+        split = data["suggested_splits"][0]
+        self.assertEqual(
+            dt.datetime.fromisoformat(split["split_at"]),
+            start + dt.timedelta(minutes=30),
+        )
+        self.assertEqual(
+            dt.datetime.fromisoformat(split["resume_at"]),
+            start + dt.timedelta(minutes=30),
+        )
+        self.assertEqual(split["confidence"], "high")
+
+    def test_get_workout_timeline_skips_low_hr_transition_gap(self):
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        start = dt.datetime(2026, 11, 23, 17, 30, tzinfo=nz_tz)
+        end = start + dt.timedelta(minutes=75)
+
+        # 30m passive class
+        for i in range(6):
+            self._add_bin_samples(
+                start + dt.timedelta(minutes=i * 5),
+                hr_values=[138, 142, 145],
+                energy_kcal=Decimal("28"),
+                watch_steps=60,
+            )
+        # 10m low-HR transition gap (2 bins)
+        for i in range(6, 8):
+            self._add_bin_samples(
+                start + dt.timedelta(minutes=i * 5),
+                hr_values=[96, 99],
+                energy_kcal=Decimal("6"),
+                watch_steps=40,
+            )
+        # 35m active Watch lifting
+        for i in range(8, 15):
+            self._add_bin_samples(
+                start + dt.timedelta(minutes=i * 5),
+                hr_values=[125 + (k % 10) for k in range(20)],
+                energy_kcal=Decimal("24"),
+                watch_steps=90,
+            )
+        self.db.commit()
+
+        res = self.client.get(
+            "/biometrics/workout-timeline",
+            params={"started_at": start.isoformat(), "ended_at": end.isoformat()},
+        )
+        self.assertEqual(res.status_code, 200)
+        splits = res.json()["suggested_splits"]
+        self.assertEqual(len(splits), 1)
+        self.assertEqual(
+            dt.datetime.fromisoformat(splits[0]["split_at"]),
+            start + dt.timedelta(minutes=30),
+        )
+        self.assertEqual(
+            dt.datetime.fromisoformat(splits[0]["resume_at"]),
+            start + dt.timedelta(minutes=40),
+        )
+        self.assertEqual(splits[0]["confidence"], "high")
+
+    def test_get_workout_timeline_active_to_gap_to_passive_and_edge_suppression(self):
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        start = dt.datetime(2026, 11, 23, 17, 30, tzinfo=nz_tz)
+        end = start + dt.timedelta(minutes=70)
+
+        # First 5m passive edge (must NOT trigger split at +5m)
+        self._add_bin_samples(start, hr_values=[130, 134], energy_kcal=Decimal("22"))
+        # Next 30m active Watch mode
+        for i in range(1, 7):
+            self._add_bin_samples(
+                start + dt.timedelta(minutes=i * 5),
+                hr_values=[142 + (k % 6) for k in range(16)],
+                energy_kcal=Decimal("32"),
+            )
+        # 5m low-HR gap
+        self._add_bin_samples(
+            start + dt.timedelta(minutes=35),
+            hr_values=[96],
+            energy_kcal=Decimal("5"),
+        )
+        # Final 30m passive exertion
+        for i in range(8, 14):
+            self._add_bin_samples(
+                start + dt.timedelta(minutes=i * 5),
+                hr_values=[124, 128],
+                energy_kcal=Decimal("22"),
+            )
+        self.db.commit()
+
+        res = self.client.get(
+            "/biometrics/workout-timeline",
+            params={"started_at": start.isoformat(), "ended_at": end.isoformat()},
+        )
+        self.assertEqual(res.status_code, 200)
+        splits = res.json()["suggested_splits"]
+        self.assertEqual(len(splits), 1)
+        self.assertEqual(
+            dt.datetime.fromisoformat(splits[0]["split_at"]),
+            start + dt.timedelta(minutes=35),
+        )
+        self.assertEqual(
+            dt.datetime.fromisoformat(splits[0]["resume_at"]),
+            start + dt.timedelta(minutes=40),
+        )
+        self.assertEqual(splits[0]["confidence"], "high")
+
+    def test_get_workout_timeline_active_gap_active_emits_single_split(self):
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        start = dt.datetime(2026, 11, 23, 17, 30, tzinfo=nz_tz)
+        end = start + dt.timedelta(minutes=70)
+
+        for i in range(6):
+            self._add_bin_samples(
+                start + dt.timedelta(minutes=i * 5),
+                hr_values=[140 + (k % 6) for k in range(20)],
+                energy_kcal=Decimal("30"),
+            )
+        self._add_bin_samples(
+            start + dt.timedelta(minutes=30),
+            hr_values=[95],
+            energy_kcal=Decimal("5"),
+        )
+        for i in range(7, 14):
+            self._add_bin_samples(
+                start + dt.timedelta(minutes=i * 5),
+                hr_values=[130 + (k % 6) for k in range(20)],
+                energy_kcal=Decimal("25"),
+            )
+        self.db.commit()
+
+        res = self.client.get(
+            "/biometrics/workout-timeline",
+            params={"started_at": start.isoformat(), "ended_at": end.isoformat()},
+        )
+        self.assertEqual(res.status_code, 200)
+        splits = res.json()["suggested_splits"]
+        self.assertEqual(len(splits), 1)
+        self.assertEqual(
+            dt.datetime.fromisoformat(splits[0]["split_at"]),
+            start + dt.timedelta(minutes=30),
+        )
+        self.assertEqual(
+            dt.datetime.fromisoformat(splits[0]["resume_at"]),
+            start + dt.timedelta(minutes=35),
+        )
+        self.assertEqual(splits[0]["confidence"], "high")
+
 
 if __name__ == "__main__":
     unittest.main()

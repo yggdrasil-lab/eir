@@ -476,11 +476,284 @@ class TestKratosSync(unittest.TestCase):
             self.assertEqual(detected["routine_name"], "Walk / Cardio")
             self.assertEqual(detected["duration_minutes"], 35)
 
-            # Verify sync_detected_workouts_to_kratos was invoked
+            # Verify sync_detected_workouts_to_kratos was invoked with db session
             mock_sync.assert_called_once()
             passed_workouts = mock_sync.call_args[0][0]
             self.assertEqual(len(passed_workouts), 1)
             self.assertEqual(passed_workouts[0].routine_name, "Walk / Cardio")
+            self.assertIsNotNone(mock_sync.call_args.kwargs.get("db"))
+
+    def _make_workout(
+        self,
+        start_dt: datetime,
+        duration_mins: int,
+        kcal: int = 650,
+    ) -> DetectedWorkoutRead:
+        return DetectedWorkoutRead(
+            started_at=start_dt,
+            ended_at=start_dt + timedelta(minutes=duration_mins),
+            duration_minutes=duration_mins,
+            active_energy_kcal=kcal,
+            avg_hr_bpm=142,
+            peak_hr_bpm=165,
+            step_count=3200,
+            confidence="high",
+            classification="gym",
+            activity_type="gym",
+            routine_name="Resistance Training",
+            effort_rating="hard",
+            rpe=8.2,
+            trimp=240.0,
+            hr_zones={"z3_tempo_pct": 40.0, "z4_threshold_pct": 35.0},
+            hr_recovery_60s=22,
+        )
+
+    def test_sync_skips_dismissed_and_split_tombstones_under_drift(self):
+        base = datetime(2026, 11, 23, 4, 30, tzinfo=timezone.utc)
+        w = self._make_workout(base + timedelta(minutes=5), 95, kcal=650)
+
+        for tombstone_extra in (
+            {"dismissed": True, "inferred": True},
+            {"split_into_ids": [str(uuid.uuid4()), str(uuid.uuid4())]},
+        ):
+            mock_http = MagicMock(spec=httpx.Client)
+            mock_list = MagicMock()
+            mock_list.status_code = 200
+            mock_list.json.return_value = [
+                {
+                    "id": str(uuid.uuid4()),
+                    "started_at": base.isoformat(),
+                    "ended_at": (base + timedelta(minutes=95)).isoformat(),
+                    "deleted_at": "2026-11-23T06:30:00+00:00",
+                    "extra": tombstone_extra,
+                    "items": [],
+                }
+            ]
+            mock_http.get.return_value = mock_list
+
+            results = sync_detected_workouts_to_kratos(
+                [w], kratos_url="http://kratos-api:8000", client=mock_http, db=self.db
+            )
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["status"], "skipped_dismissed")
+            self.assertEqual(mock_http.put.call_count, 0)
+            self.assertEqual(mock_http.delete.call_count, 0)
+            self.assertEqual(
+                mock_http.get.call_args[1]["params"],
+                {"limit": 200, "include_deleted": "true"},
+            )
+
+    def test_sync_active_confirmed_overrides_smaller_tombstone_overlap(self):
+        base = datetime(2026, 11, 23, 4, 30, tzinfo=timezone.utc)
+        w = self._make_workout(base, 95, kcal=650)
+        confirmed_id = str(uuid.uuid4())
+
+        mock_http = MagicMock(spec=httpx.Client)
+        mock_list = MagicMock()
+        mock_list.status_code = 200
+        mock_list.json.return_value = [
+            {
+                "id": str(uuid.uuid4()),
+                "started_at": base.isoformat(),
+                "ended_at": (base + timedelta(minutes=50)).isoformat(),
+                "deleted_at": "2026-11-23T06:30:00+00:00",
+                "extra": {"dismissed": True, "inferred": True},
+                "items": [],
+            },
+            {
+                "id": confirmed_id,
+                "started_at": (base + timedelta(minutes=15)).isoformat(),
+                "ended_at": (base + timedelta(minutes=95)).isoformat(),
+                "deleted_at": None,
+                "routine_id": str(uuid.uuid4()),
+                "extra": {"confirmed": True, "inferred": False},
+                "items": [],
+            },
+        ]
+        mock_http.get.return_value = mock_list
+        mock_put = MagicMock()
+        mock_put.status_code = 200
+        mock_http.put.return_value = mock_put
+
+        results = sync_detected_workouts_to_kratos(
+            [w], kratos_url="http://kratos-api:8000", client=mock_http, db=self.db
+        )
+        self.assertEqual(results[0]["status"], "reconciled")
+        self.assertEqual(results[0]["session_id"], confirmed_id)
+        self.assertEqual(mock_http.put.call_count, 1)
+
+    def test_sync_skips_multi_overlap_split_sessions_and_cleans_inferred(self):
+        base = datetime(2026, 11, 23, 4, 30, tzinfo=timezone.utc)
+        w = self._make_workout(base, 95, kcal=650)
+        stale_inferred_id = str(uuid.uuid4())
+
+        mock_http = MagicMock(spec=httpx.Client)
+        mock_list = MagicMock()
+        mock_list.status_code = 200
+        mock_list.json.return_value = [
+            {
+                "id": str(uuid.uuid4()),
+                "started_at": base.isoformat(),
+                "ended_at": (base + timedelta(minutes=60)).isoformat(),
+                "deleted_at": None,
+                "extra": {"confirmed": True, "inferred": False, "routine_name": "Group Core"},
+                "items": [],
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "started_at": (base + timedelta(minutes=60)).isoformat(),
+                "ended_at": (base + timedelta(minutes=95)).isoformat(),
+                "deleted_at": None,
+                "routine_id": str(uuid.uuid4()),
+                "extra": {"confirmed": True, "inferred": False, "routine_name": "Lower Body A"},
+                "items": [],
+            },
+            {
+                "id": stale_inferred_id,
+                "started_at": base.isoformat(),
+                "ended_at": (base + timedelta(minutes=95)).isoformat(),
+                "deleted_at": None,
+                "extra": {"inferred": True},
+                "items": [],
+            },
+        ]
+        mock_http.get.return_value = mock_list
+        mock_del = MagicMock()
+        mock_del.status_code = 204
+        mock_http.delete.return_value = mock_del
+
+        results = sync_detected_workouts_to_kratos(
+            [w], kratos_url="http://kratos-api:8000", client=mock_http, db=self.db
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "skipped_split_overlap")
+        self.assertEqual(mock_http.put.call_count, 0)
+        self.assertEqual(mock_http.delete.call_count, 1)
+        self.assertTrue(mock_http.delete.call_args[0][0].endswith(f"/sessions/{stale_inferred_id}"))
+
+    def test_sync_skips_locked_or_manual_split_sessions(self):
+        base = datetime(2026, 11, 23, 4, 30, tzinfo=timezone.utc)
+        w = self._make_workout(base, 95, kcal=650)
+
+        for lock_extra in (
+            {"confirmed": True, "inferred": False, "telemetry_locked": True, "active_energy_kcal": 250},
+            {"confirmed": True, "inferred": False, "manual_split": True, "active_energy_kcal": 250},
+            {"confirmed": True, "inferred": False, "split_from_id": str(uuid.uuid4()), "active_energy_kcal": 250},
+        ):
+            mock_http = MagicMock(spec=httpx.Client)
+            mock_list = MagicMock()
+            mock_list.status_code = 200
+            mock_list.json.return_value = [
+                {
+                    "id": str(uuid.uuid4()),
+                    "started_at": base.isoformat(),
+                    "ended_at": (base + timedelta(minutes=60)).isoformat(),
+                    "deleted_at": None,
+                    "extra": lock_extra,
+                    "items": [],
+                }
+            ]
+            mock_http.get.return_value = mock_list
+
+            results = sync_detected_workouts_to_kratos(
+                [w], kratos_url="http://kratos-api:8000", client=mock_http, db=self.db
+            )
+            self.assertEqual(results[0]["status"], "skipped_confirmed")
+            self.assertEqual(mock_http.put.call_count, 0)
+
+    def test_sync_recomputes_narrower_window_instead_of_clobbering_with_merged_block(self):
+        from zoneinfo import ZoneInfo
+
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        base = datetime(2026, 11, 23, 17, 30, tzinfo=nz_tz)
+        lift_start = base + timedelta(minutes=60)
+        lift_end = base + timedelta(minutes=95)
+        w = self._make_workout(base, 95, kcal=650)
+
+        # Seed samples in settings.tz (SQLite strips tzinfo on write):
+        # first 60m class (~440 kcal, high HR), last 35m lift (210 kcal, avg HR 126, 700 steps)
+        for m in range(0, 60, 5):
+            t = base + timedelta(minutes=m)
+            self.db.add(HealthSample(id=uuid.uuid4(), source="apple_health", sample_type="active_energy", measured_at=t, ended_at=t + timedelta(minutes=5), value=Decimal("36.7"), unit="kcal"))
+            self.db.add(HealthSample(id=uuid.uuid4(), source="apple_health", sample_type="heart_rate", measured_at=t, ended_at=t + timedelta(minutes=5), value=Decimal("152"), unit="bpm"))
+        for m in range(60, 95, 5):
+            t = base + timedelta(minutes=m)
+            self.db.add(HealthSample(id=uuid.uuid4(), source="apple_health", sample_type="active_energy", measured_at=t, ended_at=t + timedelta(minutes=5), value=Decimal("30"), unit="kcal"))
+            self.db.add(HealthSample(id=uuid.uuid4(), source="apple_health", sample_type="heart_rate", measured_at=t, ended_at=t + timedelta(minutes=5), value=Decimal("126"), unit="bpm"))
+            self.db.add(HealthSample(id=uuid.uuid4(), source="apple_health", sample_type="step_count", measured_at=t, ended_at=t + timedelta(minutes=5), value=Decimal("100"), unit="count"))
+        self.db.commit()
+
+        lift_id = str(uuid.uuid4())
+        mock_http = MagicMock(spec=httpx.Client)
+        mock_list = MagicMock()
+        mock_list.status_code = 200
+        mock_list.json.return_value = [
+            {
+                "id": lift_id,
+                "started_at": lift_start.astimezone(timezone.utc).isoformat(),
+                "ended_at": lift_end.astimezone(timezone.utc).isoformat(),
+                "deleted_at": None,
+                "routine_id": str(uuid.uuid4()),
+                "extra": {"confirmed": True, "inferred": False, "routine_name": "Lower Body A"},
+                "items": [],
+            }
+        ]
+        mock_http.get.return_value = mock_list
+        mock_put = MagicMock()
+        mock_put.status_code = 200
+        mock_http.put.return_value = mock_put
+
+        # 1. With db provided: recomputes exact 35m window metrics (210 kcal, not 650)
+        results = sync_detected_workouts_to_kratos(
+            [w], kratos_url="http://kratos-api:8000", client=mock_http, db=self.db
+        )
+        self.assertEqual(results[0]["status"], "reconciled")
+        self.assertEqual(mock_http.put.call_count, 1)
+        put_extra = mock_http.put.call_args[1]["json"]["extra"]
+        self.assertEqual(put_extra["active_energy_kcal"], 210)
+        self.assertEqual(put_extra["step_count"], 700)
+        self.assertEqual(put_extra["avg_hr"], 126)
+        self.assertTrue(put_extra["telemetry_reconciled"])
+
+        # 2. Next sync once reconciled with < 0.80 * w_duration: skips even though 210 < 650
+        mock_http.reset_mock()
+        mock_list.json.return_value = [
+            {
+                "id": lift_id,
+                "started_at": lift_start.isoformat(),
+                "ended_at": lift_end.isoformat(),
+                "deleted_at": None,
+                "routine_id": str(uuid.uuid4()),
+                "extra": put_extra,
+                "items": [],
+            }
+        ]
+        mock_http.get.return_value = mock_list
+        results_2 = sync_detected_workouts_to_kratos(
+            [w], kratos_url="http://kratos-api:8000", client=mock_http, db=self.db
+        )
+        self.assertEqual(results_2[0]["status"], "skipped_confirmed")
+        self.assertEqual(mock_http.put.call_count, 0)
+
+        # 3. Without db provided for narrower unlocked unreconciled session: never clobbers with whole block
+        mock_http.reset_mock()
+        mock_list.json.return_value = [
+            {
+                "id": lift_id,
+                "started_at": lift_start.isoformat(),
+                "ended_at": lift_end.isoformat(),
+                "deleted_at": None,
+                "routine_id": str(uuid.uuid4()),
+                "extra": {"confirmed": True, "inferred": False, "routine_name": "Lower Body A"},
+                "items": [],
+            }
+        ]
+        mock_http.get.return_value = mock_list
+        results_3 = sync_detected_workouts_to_kratos(
+            [w], kratos_url="http://kratos-api:8000", client=mock_http, db=None
+        )
+        self.assertEqual(results_3[0]["status"], "skipped_confirmed")
+        self.assertEqual(mock_http.put.call_count, 0)
 
 
 if __name__ == "__main__":
