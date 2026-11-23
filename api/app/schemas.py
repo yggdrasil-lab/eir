@@ -206,6 +206,38 @@ class DetectedWorkoutRead(BaseModel):
     hr_recovery_60s: int | None = None  # Post-exercise 60s heart rate drop in bpm
 
 
+class TimelineBinRead(BaseModel):
+    """5-minute biometric bin used to inspect Watch mode transitions inside a workout window."""
+
+    started_at: datetime
+    ended_at: datetime
+    avg_hr_bpm: int | None = None
+    peak_hr_bpm: int | None = None
+    hr_sample_count: int = 0
+    step_count: int = 0
+    active_energy_kcal: int = 0
+    is_active_watch_mode: bool = False
+
+
+class SuggestedSplitRead(BaseModel):
+    """Suggested split boundary around passive<->active Apple Watch mode transitions."""
+
+    split_at: datetime
+    resume_at: datetime
+    reason: str
+    confidence: str = "high"
+
+
+class WorkoutTimelineRead(BaseModel):
+    """5-minute resolution workout timeline and suggested split boundaries."""
+
+    started_at: datetime
+    ended_at: datetime
+    duration_minutes: int
+    bins: list[TimelineBinRead] = Field(default_factory=list)
+    suggested_splits: list[SuggestedSplitRead] = Field(default_factory=list)
+
+
 class DailyBiometricSummary(BaseModel):
     """Daily aggregated vitals rollup for morning briefings and retrospectives."""
 

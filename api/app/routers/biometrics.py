@@ -17,13 +17,17 @@ from app.schemas import (
     DailyBiometricSummary,
     DetectedWorkoutRead,
     HealthSampleRead,
+    WorkoutTimelineRead,
 )
 from app.services.biometrics import (
+    SampleSlot,
+    bucket_samples_into_5min_slots,
+    build_workout_timeline,
     classify_activity_pattern,
     compute_workout_exertion_metrics,
     deduplicate_step_samples,
     estimate_workout_active_calories,
-    filter_deduplicated_step_samples,
+    sample_local_dt,
 )
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
@@ -31,7 +35,35 @@ router = APIRouter(prefix="/biometrics", tags=["biometrics"])
 
 def _sample_local_dt(s: HealthSample) -> datetime:
     """Normalizes a HealthSample timestamp to settings.tz."""
-    return s.measured_at.astimezone(settings.tz) if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=settings.tz)
+    return sample_local_dt(s, settings.tz)
+
+
+def _normalize_window_bounds(started_at: datetime, ended_at: datetime) -> tuple[datetime, datetime]:
+    """Normalizes window timestamps to settings.tz and validates chronological ordering."""
+    s_time = started_at.astimezone(settings.tz) if started_at.tzinfo else started_at.replace(tzinfo=settings.tz)
+    e_time = ended_at.astimezone(settings.tz) if ended_at.tzinfo else ended_at.replace(tzinfo=settings.tz)
+    if e_time <= s_time:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="ended_at must be after started_at",
+        )
+    return s_time, e_time
+
+
+def _fetch_exertion_samples(db: Session, start_dt: datetime, end_dt: datetime) -> list[HealthSample]:
+    """Fetches active energy, heart rate, and step samples inside [start_dt, end_dt]."""
+    return list(
+        db.scalars(
+            select(HealthSample)
+            .where(
+                HealthSample.deleted_at.is_(None),
+                HealthSample.sample_type.in_(["active_energy", "heart_rate", "step_count"]),
+                HealthSample.measured_at >= start_dt,
+                HealthSample.measured_at <= end_dt,
+            )
+            .order_by(HealthSample.measured_at.asc())
+        )
+    )
 
 
 def _build_detected_workout(
@@ -121,6 +153,39 @@ def _build_detected_workout(
     )
 
 
+def _resolve_window_pattern(
+    slots: tuple[SampleSlot, ...],
+    duration_mins: int,
+    block_energy: Decimal,
+    avg_hr: int | None,
+    peak_hr: int | None,
+    all_hrs: list[float],
+    block_steps: Decimal,
+    classification: str | None,
+    activity_type: str | None,
+    routine_name: str | None,
+) -> dict[str, str]:
+    """Determines workout classification from explicit overrides or 5-minute slot patterns."""
+    if classification or activity_type or routine_name:
+        cls_val = classification or activity_type or "gym"
+        return {
+            "classification": cls_val,
+            "activity_type": activity_type or cls_val,
+            "routine_name": routine_name or "Workout",
+        }
+    return classify_activity_pattern(
+        duration_mins=duration_mins,
+        block_energy=block_energy,
+        avg_hr=avg_hr,
+        peak_hr=peak_hr,
+        all_hrs=all_hrs,
+        block_steps=block_steps,
+        slot_steps=[slot.steps for slot in slots],
+        slot_hrs=[(sum(slot.hr_values) / len(slot.hr_values)) if slot.hr_values else None for slot in slots],
+        slot_energies=[slot.energy for slot in slots],
+    )
+
+
 def compute_workout_metrics_for_window(
     db: Session,
     started_at: datetime,
@@ -130,108 +195,134 @@ def compute_workout_metrics_for_window(
     routine_name: str | None = None,
 ) -> DetectedWorkoutRead:
     """Computes full Eir workout exertion metrics (HR zones, TRIMP, RPE, steps, recovery) for any window."""
-    s_time = started_at.astimezone(settings.tz) if started_at.tzinfo else started_at.replace(tzinfo=settings.tz)
-    e_time = ended_at.astimezone(settings.tz) if ended_at.tzinfo else ended_at.replace(tzinfo=settings.tz)
-    if e_time <= s_time:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="ended_at must be after started_at",
-        )
-
-    post_e_time = e_time + timedelta(seconds=90)
-    samples = list(
-        db.scalars(
-            select(HealthSample)
-            .where(
-                HealthSample.deleted_at.is_(None),
-                HealthSample.sample_type.in_(["active_energy", "heart_rate", "step_count"]),
-                HealthSample.measured_at >= s_time,
-                HealthSample.measured_at <= post_e_time,
-            )
-            .order_by(HealthSample.measured_at.asc())
-        )
-    )
+    s_time, e_time = _normalize_window_bounds(started_at, ended_at)
+    samples = _fetch_exertion_samples(db, s_time, e_time + timedelta(seconds=90))
+    bucketed = bucket_samples_into_5min_slots(samples, s_time, e_time, settings.tz)
 
     duration_mins = max(1, int(round((e_time - s_time).total_seconds() / 60)))
-    block_energy = sum(
-        (
-            s.value
-            for s in samples
-            if s.sample_type in ("active_energy", "active_energy_kcal")
-            and s_time <= _sample_local_dt(s) < e_time
-        ),
-        Decimal(0),
-    )
+    block_energy = sum((slot.energy for slot in bucketed.slots), Decimal(0))
+    block_steps = sum((slot.steps for slot in bucketed.slots), Decimal(0))
     all_hrs = [
-        float(s.value)
-        for s in samples
-        if s.sample_type in ("heart_rate", "resting_hr")
-        and s_time <= _sample_local_dt(s) <= e_time
+        float(s.value) for s in samples
+        if s.sample_type in ("heart_rate", "resting_hr") and s_time <= _sample_local_dt(s) <= e_time
     ]
-    step_samples = [
-        s
-        for s in samples
-        if s.sample_type in ("step_count", "steps")
-        and s_time <= _sample_local_dt(s) < e_time
-    ]
-    deduped_step_samples = filter_deduplicated_step_samples(step_samples)
-    block_steps = sum((s.value for s in deduped_step_samples), Decimal(0))
     avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
     peak_hr = int(round(max(all_hrs))) if all_hrs else None
+    pattern = _resolve_window_pattern(
+        slots=bucketed.slots, duration_mins=duration_mins, block_energy=block_energy,
+        avg_hr=avg_hr, peak_hr=peak_hr, all_hrs=all_hrs, block_steps=block_steps,
+        classification=classification, activity_type=activity_type, routine_name=routine_name,
+    )
+    return _build_detected_workout(
+        db, s_time=s_time, e_time=e_time, end_dt=e_time, duration_mins=duration_mins,
+        block_energy=block_energy, all_hrs=all_hrs, block_steps=block_steps,
+        samples=samples, pattern=pattern, confidence="high",
+    )
 
-    if classification or activity_type or routine_name:
-        cls_val = classification or activity_type or "gym"
-        pattern = {
-            "classification": cls_val,
-            "activity_type": activity_type or cls_val,
-            "routine_name": routine_name or "Workout",
-        }
-    else:
-        num_slots = max(1, (duration_mins + 4) // 5)
-        slot_steps = [Decimal(0)] * num_slots
-        slot_hr_lists: list[list[float]] = [[] for _ in range(num_slots)]
-        slot_energies = [Decimal(0)] * num_slots
-        for s in samples:
-            dt_val = _sample_local_dt(s)
-            if not (s_time <= dt_val < e_time):
-                continue
-            idx = min(num_slots - 1, int((dt_val - s_time).total_seconds() // 300))
-            if s.sample_type in ("active_energy", "active_energy_kcal"):
-                slot_energies[idx] += s.value
-            elif s.sample_type in ("heart_rate", "resting_hr"):
-                slot_hr_lists[idx].append(float(s.value))
-        for i in range(num_slots):
-            slot_s = s_time + timedelta(minutes=i * 5)
-            slot_e = slot_s + timedelta(minutes=5)
-            slot_steps[i] = sum(
-                (x.value for x in deduped_step_samples if slot_s <= _sample_local_dt(x) < slot_e),
-                Decimal(0),
-            )
-        slot_hrs = [(sum(h) / len(h)) if h else None for h in slot_hr_lists]
-        pattern = classify_activity_pattern(
-            duration_mins=duration_mins,
-            block_energy=block_energy,
-            avg_hr=avg_hr,
-            peak_hr=peak_hr,
-            all_hrs=all_hrs,
-            block_steps=block_steps,
-            slot_steps=slot_steps,
-            slot_hrs=slot_hrs,
-            slot_energies=slot_energies,
-        )
 
+def compute_workout_timeline(db: Session, started_at: datetime, ended_at: datetime) -> WorkoutTimelineRead:
+    """Builds 5-minute biometric bins and passive<->active Watch split hints for a window."""
+    s_time, e_time = _normalize_window_bounds(started_at, ended_at)
+    samples = _fetch_exertion_samples(db, s_time, e_time)
+    bucketed = bucket_samples_into_5min_slots(samples, s_time, e_time, settings.tz)
+    return build_workout_timeline(bucketed.slots, s_time, e_time)
+
+
+def _is_active_slot(slot: SampleSlot) -> bool:
+    avg_hr = (sum(slot.hr_values) / len(slot.hr_values)) if slot.hr_values else None
+    return (
+        (slot.energy >= Decimal(20))
+        or (avg_hr is not None and avg_hr >= 120.0)
+        or (slot.steps >= Decimal(250) and avg_hr is not None and avg_hr >= 95.0)
+        or (slot.energy >= Decimal(15) and avg_hr is not None and avg_hr >= 100.0)
+    )
+
+
+def _gap_splits_cluster(slots: tuple[SampleSlot, ...], curr: list[int], next_idx: int) -> bool:
+    """Returns True when the inter-slot gap contains >= 10m stationary rest or transit walking."""
+    curr_total_steps = sum((slots[c].steps for c in curr), Decimal(0))
+    curr_cadence = float(curr_total_steps) / (len(curr) * 5) if curr else 0.0
+    consecutive_stationary = 0
+    for g_idx in range(curr[-1] + 1, next_idx):
+        g_steps = slots[g_idx].steps
+        if g_steps < Decimal(50):
+            consecutive_stationary += 1
+            if consecutive_stationary >= 2:
+                return True
+        else:
+            consecutive_stationary = 0
+        if (curr_cadence < 25.0 and g_steps >= Decimal(250)) or (g_steps >= Decimal(500)):
+            return True
+    return False
+
+
+def _cluster_active_slots(slots: tuple[SampleSlot, ...]) -> list[tuple[int, int]]:
+    active_indices = [i for i, slot in enumerate(slots) if _is_active_slot(slot)]
+    if not active_indices:
+        return []
+    clusters: list[tuple[int, int]] = []
+    curr = [active_indices[0]]
+    for idx in active_indices[1:]:
+        if (idx - curr[-1] <= 3) and not _gap_splits_cluster(slots, curr, idx):
+            curr.append(idx)
+            continue
+        clusters.append((curr[0], curr[-1]))
+        curr = [idx]
+    clusters.append((curr[0], curr[-1]))
+    return clusters
+
+
+def _passes_cluster_noise_filter(
+    duration_mins: int,
+    block_energy: Decimal,
+    block_steps: Decimal,
+    all_hrs: list[float],
+    avg_hr: int | None,
+    peak_hr: int | None,
+) -> bool:
+    hr_spread = (max(all_hrs) - min(all_hrs)) if all_hrs else 0.0
+    cadence = float(block_steps) / duration_mins if duration_mins > 0 else 0.0
+    is_high_intensity = duration_mins >= 30 and (block_energy >= Decimal(250) or (avg_hr is not None and avg_hr >= 120))
+    is_sustained_walk = duration_mins >= 25 and block_steps >= Decimal(1500) and (avg_hr is None or avg_hr >= 90)
+    is_resistance = duration_mins >= 30 and block_energy >= Decimal(120) and (hr_spread >= 20 or (peak_hr is not None and peak_hr >= 115))
+    is_swim = duration_mins >= 20 and block_energy >= Decimal(100) and (avg_hr is not None and avg_hr >= 110) and cadence < 25.0
+    return is_high_intensity or is_sustained_walk or is_resistance or is_swim
+
+
+def _build_cluster_workout(
+    db: Session,
+    *,
+    start_dt: datetime,
+    end_dt: datetime,
+    samples: list[HealthSample],
+    slots: tuple[SampleSlot, ...],
+    start_idx: int,
+    end_idx: int,
+) -> DetectedWorkoutRead | None:
+    cluster_slots = slots[start_idx : end_idx + 1]
+    duration_mins = (end_idx - start_idx + 1) * 5
+    block_energy = sum((slot.energy for slot in cluster_slots), Decimal(0))
+    block_steps = sum((slot.steps for slot in cluster_slots), Decimal(0))
+    all_hrs = [hr for slot in cluster_slots for hr in slot.hr_values]
+    avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
+    peak_hr = int(round(max(all_hrs))) if all_hrs else None
+    if not _passes_cluster_noise_filter(duration_mins, block_energy, block_steps, all_hrs, avg_hr, peak_hr):
+        return None
+
+    pattern = classify_activity_pattern(
+        duration_mins=duration_mins, block_energy=block_energy, avg_hr=avg_hr, peak_hr=peak_hr,
+        all_hrs=all_hrs, block_steps=block_steps,
+        slot_steps=[slot.steps for slot in cluster_slots],
+        slot_hrs=[(sum(slot.hr_values) / len(slot.hr_values)) if slot.hr_values else None for slot in cluster_slots],
+        slot_energies=[slot.energy for slot in cluster_slots],
+    )
+    conf = "high" if (avg_hr and avg_hr >= 130 and block_energy >= Decimal(350)) else "medium"
     return _build_detected_workout(
         db,
-        s_time=s_time,
-        e_time=e_time,
-        end_dt=e_time,
-        duration_mins=duration_mins,
-        block_energy=block_energy,
-        all_hrs=all_hrs,
-        block_steps=block_steps,
-        samples=samples,
-        pattern=pattern,
-        confidence="high",
+        s_time=start_dt + timedelta(minutes=start_idx * 5),
+        e_time=start_dt + timedelta(minutes=(end_idx + 1) * 5),
+        end_dt=end_dt, duration_mins=duration_mins, block_energy=block_energy,
+        all_hrs=all_hrs, block_steps=block_steps, samples=samples, pattern=pattern, confidence=conf,
     )
 
 
@@ -239,182 +330,19 @@ def detect_workouts_for_day(db: Session, target_date: date) -> list[DetectedWork
     """Infers sustained physical exertion blocks from granular active energy and heart rate samples."""
     start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
     end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
-
-    samples = list(
-        db.scalars(
-            select(HealthSample)
-            .where(
-                HealthSample.deleted_at.is_(None),
-                HealthSample.sample_type.in_(["active_energy", "heart_rate", "step_count"]),
-                HealthSample.measured_at >= start_dt,
-                HealthSample.measured_at <= end_dt,
-            )
-            .order_by(HealthSample.measured_at.asc())
-        )
-    )
-
+    samples = _fetch_exertion_samples(db, start_dt, end_dt)
     if not samples:
         return []
 
-    # Pre-deduplicate all day step samples once before bucketing into 5-minute slots
-    # so Watch samples in adjacent slots cleanly suppress overlapping iPhone samples.
-    deduped_step_samples = filter_deduplicated_step_samples(
-        [s for s in samples if s.sample_type in ("step_count", "steps")]
-    )
-
-    # Partition 24 hours into 288 5-minute slots for exertion thresholding
-    slots = [{"energy": Decimal(0), "hr_vals": [], "step_samples": []} for _ in range(288)]
-    for s in samples:
-        dt = _sample_local_dt(s)
-        offset = (dt - start_dt).total_seconds()
-        idx = int(offset // 300)
-        if 0 <= idx < 288:
-            if s.sample_type in ("active_energy", "active_energy_kcal"):
-                slots[idx]["energy"] += s.value
-            elif s.sample_type in ("heart_rate", "resting_hr"):
-                slots[idx]["hr_vals"].append(float(s.value))
-    for s in deduped_step_samples:
-        dt = _sample_local_dt(s)
-        offset = (dt - start_dt).total_seconds()
-        idx = int(offset // 300)
-        if 0 <= idx < 288:
-            slots[idx]["step_samples"].append(s)
-
-    active_indices = []
-    for i, slot in enumerate(slots):
-        avg_hr = (sum(slot["hr_vals"]) / len(slot["hr_vals"])) if slot["hr_vals"] else None
-        slot_step_val = sum((s.value for s in slot["step_samples"]), Decimal(0))
-        # Exertion threshold: >= 20 kcal in 5m (~4 kcal/min), avg HR >= 120 bpm, cadence >= 250 steps/5m with avg HR >= 95 bpm, or gym exertion (energy >= 15 kcal with HR >= 100 bpm)
-        is_active = (
-            (slot["energy"] >= Decimal(20))
-            or (avg_hr is not None and avg_hr >= 120.0)
-            or (slot_step_val >= Decimal(250) and avg_hr is not None and avg_hr >= 95.0)
-            or (slot["energy"] >= Decimal(15) and avg_hr is not None and avg_hr >= 100.0)
-        )
-        if is_active:
-            active_indices.append(i)
-
-    if not active_indices:
-        return []
-
-    # Merge clusters with max gap of 3 slots (15 minutes) to bridge short rest/water intervals.
-    # Rest Gap Splitting: Ensure stationary intervals (>= 10 min with < 50 steps/5min)
-    # split sessions into separate blocks instead of bridging across rest gaps.
-    # Transit Walk Splitting: Ensure transit walking intervals (>= 250 steps for low-cadence
-    # activities like swimming, or >= 500 steps fleet-wide) split sessions rather than merging.
-    clusters: list[tuple[int, int]] = []
-    curr = [active_indices[0]]
-    for idx in active_indices[1:]:
-        gap_has_stationary_rest = False
-        consecutive_stationary = 0
-        gap_has_transit_walk = False
-
-        curr_total_steps = sum(
-            (sum((s.value for s in slots[c]["step_samples"]), Decimal(0)) for c in curr),
-            Decimal(0),
-        )
-        curr_cadence = float(curr_total_steps) / (len(curr) * 5) if curr else 0.0
-
-        for g_idx in range(curr[-1] + 1, idx):
-            g_steps = sum((s.value for s in slots[g_idx]["step_samples"]), Decimal(0))
-            if g_steps < Decimal(50):
-                consecutive_stationary += 1
-                if consecutive_stationary >= 2:  # 2 slots * 5 min = 10 min
-                    gap_has_stationary_rest = True
-                    break
-            else:
-                consecutive_stationary = 0
-
-            # Transit walk detection: if non-walking activity (cadence < 25) and gap steps >= 250,
-            # or any activity and gap steps >= 500 (e.g. outdoor transit walk between sessions)
-            if (curr_cadence < 25.0 and g_steps >= Decimal(250)) or (g_steps >= Decimal(500)):
-                gap_has_transit_walk = True
-                break
-
-        if (idx - curr[-1] <= 3) and not gap_has_stationary_rest and not gap_has_transit_walk:
-            curr.append(idx)
-        else:
-            clusters.append((curr[0], curr[-1]))
-            curr = [idx]
-    if curr:
-        clusters.append((curr[0], curr[-1]))
-
+    bucketed = bucket_samples_into_5min_slots(samples, start_dt, end_dt, settings.tz, fixed_slot_count=288)
     detected: list[DetectedWorkoutRead] = []
-    for start_idx, end_idx in clusters:
-        duration_mins = (end_idx - start_idx + 1) * 5
-        block_energy = sum((slots[i]["energy"] for i in range(start_idx, end_idx + 1)), Decimal(0))
-        all_hrs: list[float] = []
-        slot_hrs: list[float | None] = []
-        slot_steps: list[Decimal] = []
-        slot_energies: list[Decimal] = []
-        for i in range(start_idx, end_idx + 1):
-            all_hrs.extend(slots[i]["hr_vals"])
-            s_hr = (
-                (sum(slots[i]["hr_vals"]) / len(slots[i]["hr_vals"]))
-                if slots[i]["hr_vals"]
-                else None
-            )
-            slot_hrs.append(s_hr)
-            s_steps = sum((s.value for s in slots[i]["step_samples"]), Decimal(0))
-            slot_steps.append(s_steps)
-            slot_energies.append(slots[i]["energy"])
-
-        avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
-        peak_hr = int(round(max(all_hrs))) if all_hrs else None
-
-        s_time = start_dt + timedelta(minutes=start_idx * 5)
-        e_time = start_dt + timedelta(minutes=(end_idx + 1) * 5)
-        block_steps = sum(
-            (
-                s.value
-                for s in deduped_step_samples
-                if s_time <= _sample_local_dt(s) < e_time
-            ),
-            Decimal(0),
+    for start_idx, end_idx in _cluster_active_slots(bucketed.slots):
+        workout = _build_cluster_workout(
+            db, start_dt=start_dt, end_dt=end_dt, samples=samples,
+            slots=bucketed.slots, start_idx=start_idx, end_idx=end_idx,
         )
-
-        # Filter noise:
-        # 1. High-intensity workout: >= 30 mins AND (energy >= 250 kcal OR avg HR >= 120)
-        # 2. Sustained walking: >= 25 mins AND block_steps >= 1500 AND avg HR >= 90
-        # 3. Gym / Resistance: >= 30 mins AND block_energy >= 120 kcal AND (hr_spread >= 20 OR peak_hr >= 115)
-        # 4. Swimming / Aquatic: >= 20 mins AND block_energy >= 100 kcal AND (avg_hr is not None and avg_hr >= 110) AND cadence < 25
-        hr_spread = (max(all_hrs) - min(all_hrs)) if all_hrs else 0
-        cadence = float(block_steps) / duration_mins if duration_mins > 0 else 0.0
-
-        is_high_intensity = duration_mins >= 30 and (block_energy >= Decimal(250) or (avg_hr is not None and avg_hr >= 120))
-        is_sustained_walk = duration_mins >= 25 and (block_steps >= Decimal(1500)) and (avg_hr is None or avg_hr >= 90)
-        is_resistance = duration_mins >= 30 and block_energy >= Decimal(120) and (hr_spread >= 20 or (peak_hr is not None and peak_hr >= 115))
-        is_swim = duration_mins >= 20 and block_energy >= Decimal(100) and (avg_hr is not None and avg_hr >= 110) and cadence < 25.0
-
-        if is_high_intensity or is_sustained_walk or is_resistance or is_swim:
-            conf = "high" if (avg_hr and avg_hr >= 130 and block_energy >= Decimal(350)) else "medium"
-            pattern = classify_activity_pattern(
-                duration_mins=duration_mins,
-                block_energy=block_energy,
-                avg_hr=avg_hr,
-                peak_hr=peak_hr,
-                all_hrs=all_hrs,
-                block_steps=block_steps,
-                slot_steps=slot_steps,
-                slot_hrs=slot_hrs,
-                slot_energies=slot_energies,
-            )
-            detected.append(
-                _build_detected_workout(
-                    db,
-                    s_time=s_time,
-                    e_time=e_time,
-                    end_dt=end_dt,
-                    duration_mins=duration_mins,
-                    block_energy=block_energy,
-                    all_hrs=all_hrs,
-                    block_steps=block_steps,
-                    samples=samples,
-                    pattern=pattern,
-                    confidence=conf,
-                )
-            )
-
+        if workout is not None:
+            detected.append(workout)
     return detected
 
 
@@ -677,6 +605,16 @@ def get_workout_metrics(
         activity_type=activity_type,
         routine_name=routine_name,
     )
+
+
+@router.get("/workout-timeline", response_model=WorkoutTimelineRead)
+def get_workout_timeline(
+    started_at: datetime = Query(description="Window start ISO-8601 timestamp"),
+    ended_at: datetime = Query(description="Window end ISO-8601 timestamp"),
+    db: Session = Depends(get_db),
+) -> WorkoutTimelineRead:
+    """Returns 5-minute biometric bins and Watch mode transition split suggestions for a window."""
+    return compute_workout_timeline(db, started_at=started_at, ended_at=ended_at)
 
 
 @router.get("", response_model=list[BiometricRead])

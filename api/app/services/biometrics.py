@@ -1,12 +1,292 @@
 """Biometric processing, multi-device deduplication, and exertion inference engines."""
 
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from typing import Any
 
 from app.config import settings
 from app.models import HealthSample
+from app.schemas import SuggestedSplitRead, TimelineBinRead, WorkoutTimelineRead
+
+ACTIVE_WATCH_HR_SAMPLES_MIN = 15
+SLOT_SECONDS = 300
+
+
+@dataclass(frozen=True)
+class SampleSlot:
+    """Immutable 5-minute biometric bucket for workout detection and timeline analysis."""
+
+    started_at: datetime
+    ended_at: datetime
+    energy: Decimal
+    hr_values: tuple[float, ...]
+    steps: Decimal
+
+
+@dataclass(frozen=True)
+class BucketedWindow:
+    """Container of 5-minute biometric slots and deduplicated step samples."""
+
+    slots: tuple[SampleSlot, ...]
+    deduped_step_samples: tuple[HealthSample, ...]
+
+
+def sample_local_dt(sample: HealthSample, tz: tzinfo) -> datetime:
+    """Normalizes a HealthSample measured_at timestamp to the target timezone."""
+    if sample.measured_at.tzinfo:
+        return sample.measured_at.astimezone(tz)
+    return sample.measured_at.replace(tzinfo=tz)
+
+
+def _accumulate_slot_samples(
+    samples: Sequence[HealthSample],
+    deduped_steps: Sequence[HealthSample],
+    start_dt: datetime,
+    end_dt: datetime,
+    tz: tzinfo,
+    num_slots: int,
+    inclusive_end: bool,
+) -> tuple[list[Decimal], list[list[float]], list[Decimal]]:
+    energies = [Decimal(0)] * num_slots
+    hr_lists: list[list[float]] = [[] for _ in range(num_slots)]
+    step_totals = [Decimal(0)] * num_slots
+
+    for s in samples:
+        dt_val = sample_local_dt(s, tz)
+        if not _in_bucket_bounds(dt_val, start_dt, end_dt, inclusive_end):
+            continue
+        idx = int((dt_val - start_dt).total_seconds() // SLOT_SECONDS)
+        if not (0 <= idx < num_slots):
+            continue
+        if s.sample_type in ("active_energy", "active_energy_kcal"):
+            energies[idx] += s.value
+        elif s.sample_type in ("heart_rate", "resting_hr"):
+            hr_lists[idx].append(float(s.value))
+
+    for s in deduped_steps:
+        idx = int((sample_local_dt(s, tz) - start_dt).total_seconds() // SLOT_SECONDS)
+        if 0 <= idx < num_slots:
+            step_totals[idx] += s.value
+    return energies, hr_lists, step_totals
+
+
+def bucket_samples_into_5min_slots(
+    samples: Sequence[HealthSample],
+    start_dt: datetime,
+    end_dt: datetime,
+    tz: tzinfo,
+    fixed_slot_count: int | None = None,
+) -> BucketedWindow:
+    """Buckets energy, heart rate, and deduplicated step samples into 5-minute slots."""
+    inclusive_end = fixed_slot_count is not None
+    raw_steps = [
+        s for s in samples
+        if s.sample_type in ("step_count", "steps")
+        and _in_bucket_bounds(sample_local_dt(s, tz), start_dt, end_dt, inclusive_end)
+    ]
+    deduped_steps = filter_deduplicated_step_samples(raw_steps)
+    num_slots = (
+        fixed_slot_count
+        if fixed_slot_count is not None
+        else max(1, (int((end_dt - start_dt).total_seconds()) + SLOT_SECONDS - 1) // SLOT_SECONDS)
+    )
+    energies, hr_lists, step_totals = _accumulate_slot_samples(
+        samples, deduped_steps, start_dt, end_dt, tz, num_slots, inclusive_end
+    )
+    slots = tuple(
+        SampleSlot(
+            started_at=start_dt + timedelta(minutes=i * 5),
+            ended_at=min(start_dt + timedelta(minutes=(i + 1) * 5), end_dt),
+            energy=energies[i],
+            hr_values=tuple(hr_lists[i]),
+            steps=step_totals[i],
+        )
+        for i in range(num_slots)
+    )
+    return BucketedWindow(slots=slots, deduped_step_samples=tuple(deduped_steps))
+
+
+def _in_bucket_bounds(
+    dt_val: datetime,
+    start_dt: datetime,
+    end_dt: datetime,
+    inclusive_end: bool,
+) -> bool:
+    if dt_val < start_dt:
+        return False
+    return dt_val <= end_dt if inclusive_end else dt_val < end_dt
+
+
+def build_timeline_bins(slots: Sequence[SampleSlot]) -> list[TimelineBinRead]:
+    """Converts 5-minute biometric slots into timeline bins with Watch mode flags."""
+    bins: list[TimelineBinRead] = []
+    for slot in slots:
+        hr_count = len(slot.hr_values)
+        avg_hr = int(round(sum(slot.hr_values) / hr_count)) if hr_count else None
+        peak_hr = int(round(max(slot.hr_values))) if hr_count else None
+        bins.append(
+            TimelineBinRead(
+                started_at=slot.started_at,
+                ended_at=slot.ended_at,
+                avg_hr_bpm=avg_hr,
+                peak_hr_bpm=peak_hr,
+                hr_sample_count=hr_count,
+                step_count=int(round(slot.steps)),
+                active_energy_kcal=int(round(slot.energy)),
+                is_active_watch_mode=hr_count >= ACTIVE_WATCH_HR_SAMPLES_MIN,
+            )
+        )
+    return bins
+
+
+def _is_exertion_bin(bin_item: TimelineBinRead) -> bool:
+    return (
+        bin_item.active_energy_kcal >= 20
+        or (bin_item.avg_hr_bpm is not None and bin_item.avg_hr_bpm >= 120)
+        or (
+            bin_item.step_count >= 250
+            and bin_item.avg_hr_bpm is not None
+            and bin_item.avg_hr_bpm >= 95
+        )
+        or (
+            bin_item.active_energy_kcal >= 15
+            and bin_item.avg_hr_bpm is not None
+            and bin_item.avg_hr_bpm >= 100
+        )
+    )
+
+
+def _is_transition_gap_bin(bin_item: TimelineBinRead) -> bool:
+    if bin_item.is_active_watch_mode:
+        return False
+    if not _is_exertion_bin(bin_item):
+        return True
+    return (bin_item.avg_hr_bpm is None or bin_item.avg_hr_bpm < 105) and bin_item.active_energy_kcal < 20
+
+
+def _within_split_bounds(
+    split_at: datetime,
+    resume_at: datetime,
+    started_at: datetime,
+    ended_at: datetime,
+) -> bool:
+    min_bound = started_at + timedelta(minutes=10)
+    max_bound = ended_at - timedelta(minutes=10)
+    return split_at >= min_bound and resume_at <= max_bound and split_at <= resume_at
+
+
+def _resolve_passive_to_active(bins: Sequence[TimelineBinRead], idx: int) -> SuggestedSplitRead | None:
+    split_idx = idx
+    checked = 0
+    while checked < 2 and split_idx - 1 >= 1 and _is_transition_gap_bin(bins[split_idx - 1]):
+        split_idx -= 1
+        checked += 1
+    if not any(not _is_transition_gap_bin(b) for b in bins[:split_idx]):
+        return None
+    reason = (
+        "Active Watch workout mode started after passive transition gap"
+        if split_idx < idx
+        else "Active Watch workout mode started after passive monitoring"
+    )
+    return SuggestedSplitRead(
+        split_at=bins[split_idx].started_at,
+        resume_at=bins[idx].started_at,
+        reason=reason,
+        confidence="high",
+    )
+
+
+def _resolve_active_to_passive(
+    bins: Sequence[TimelineBinRead],
+    idx: int,
+) -> tuple[SuggestedSplitRead | None, int]:
+    gap_end = idx
+    while gap_end < len(bins) and (gap_end - idx) < 2 and _is_transition_gap_bin(bins[gap_end]):
+        gap_end += 1
+
+    if gap_end >= len(bins):
+        return None, len(bins)
+
+    if bins[gap_end].is_active_watch_mode:
+        if gap_end == idx:
+            return None, idx + 1
+        split = SuggestedSplitRead(
+            split_at=bins[idx].started_at,
+            resume_at=bins[gap_end].started_at,
+            reason="Active Watch workout mode resumed after transition gap",
+            confidence="high",
+        )
+        return split, gap_end + 1
+
+    if gap_end == idx:
+        split = SuggestedSplitRead(
+            split_at=bins[idx].started_at,
+            resume_at=bins[idx].started_at,
+            reason="Active Watch workout mode ended while passive exertion continued",
+            confidence="high",
+        )
+        return split, idx + 1
+
+    if not any(not _is_transition_gap_bin(b) for b in bins[gap_end:]):
+        return None, len(bins)
+    split = SuggestedSplitRead(
+        split_at=bins[idx].started_at,
+        resume_at=bins[gap_end].started_at,
+        reason="Active Watch workout mode ended before transition gap",
+        confidence="high",
+    )
+    return split, gap_end + 1
+
+
+def suggest_timeline_splits(
+    bins: Sequence[TimelineBinRead],
+    started_at: datetime,
+    ended_at: datetime,
+) -> list[SuggestedSplitRead]:
+    """Detects passive<->active Watch mode transitions within [started_at + 10m, ended_at - 10m]."""
+    if (ended_at - started_at) < timedelta(minutes=20) or len(bins) < 3:
+        return []
+
+    suggestions: list[SuggestedSplitRead] = []
+    idx = 1
+    while idx < len(bins):
+        prev_active = bins[idx - 1].is_active_watch_mode
+        curr_active = bins[idx].is_active_watch_mode
+        candidate: SuggestedSplitRead | None = None
+        next_idx = idx + 1
+
+        if not prev_active and curr_active:
+            candidate = _resolve_passive_to_active(bins, idx)
+        elif prev_active and not curr_active:
+            candidate, next_idx = _resolve_active_to_passive(bins, idx)
+
+        if candidate is not None and _within_split_bounds(
+            candidate.split_at, candidate.resume_at, started_at, ended_at
+        ):
+            suggestions.append(candidate)
+        idx = next_idx
+
+    return suggestions
+
+
+def build_workout_timeline(
+    slots: Sequence[SampleSlot],
+    started_at: datetime,
+    ended_at: datetime,
+) -> WorkoutTimelineRead:
+    """Assembles a WorkoutTimelineRead from 5-minute slots and transition split hints."""
+    duration_mins = max(1, int(round((ended_at - started_at).total_seconds() / 60)))
+    bins = build_timeline_bins(slots)
+    suggested_splits = suggest_timeline_splits(bins, started_at, ended_at)
+    return WorkoutTimelineRead(
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_minutes=duration_mins,
+        bins=bins,
+        suggested_splits=suggested_splits,
+    )
 
 
 def _normalize_dt(dt_val: datetime) -> datetime:

@@ -7,6 +7,7 @@ persisting biometrics and high-resolution health samples.
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import logging
+from typing import Any
 import urllib.parse
 import uuid
 
@@ -27,6 +28,7 @@ from app.schemas import (
     AppleHealthSyncResponse,
     BiometricRead,
     DetectedWorkoutRead,
+    HealthSampleItem,
     WithingsAuthStatusResponse,
     WithingsMeasurementPayload,
 )
@@ -343,6 +345,88 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
     return measurement
 
 
+def _log_sync_extra_keys(extra: dict[str, Any]) -> None:
+    logger.info("Apple Health sync received. Extra keys: %s", list(extra.keys()))
+    for k, v in extra.items():
+        val_str = str(v)
+        preview = val_str[:120] + "..." if len(val_str) > 120 else val_str
+        logger.info("  Key [%s] (type %s): %s", k, type(v).__name__, preview)
+
+
+def _find_matching_scale_sample(
+    existing_samples: list[HealthSample],
+    sample_type: str,
+    measured_at: datetime,
+) -> HealthSample | None:
+    it_dt = measured_at if measured_at.tzinfo else measured_at.replace(tzinfo=timezone.utc)
+    for s in existing_samples:
+        if s.sample_type != sample_type:
+            continue
+        s_dt = s.measured_at if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=timezone.utc)
+        if abs((s_dt - it_dt).total_seconds()) <= 60:
+            return s
+    return None
+
+
+def _fetch_existing_sample_index(
+    db: Session,
+    items: list[HealthSampleItem],
+) -> tuple[list[HealthSample], dict[tuple[str, str, str, str], HealthSample]]:
+    min_date = min(it.measured_at for it in items)
+    max_date = max((it.ended_at or it.measured_at) for it in items)
+    existing_samples = list(
+        db.scalars(
+            select(HealthSample).where(
+                HealthSample.deleted_at.is_(None),
+                HealthSample.measured_at >= min_date - timedelta(seconds=60),
+                HealthSample.measured_at <= max_date + timedelta(seconds=60),
+            )
+        )
+    )
+    existing_map = {
+        (s.source, s.sample_type, _normalize_key_dt(s.measured_at), _normalize_key_dt(s.ended_at)): s
+        for s in existing_samples
+    }
+    return existing_samples, existing_map
+
+
+def _upsert_health_samples(
+    db: Session,
+    items: list[HealthSampleItem],
+    default_source: str,
+) -> dict[str, int]:
+    existing_samples, existing_map = _fetch_existing_sample_index(db, items)
+    scale_types = {"weight", "weight_kg", "body_fat_pct", "body_fat", "muscle_mass_kg", "water_pct", "bone_mass_kg"}
+    metrics_counts: dict[str, int] = {}
+
+    for item in items:
+        st = item.sample_type or "unknown"
+        metrics_counts[st] = metrics_counts.get(st, 0) + 1
+        ended_at = item.ended_at or item.measured_at
+        source = item.source or default_source
+        key = (source, st, _normalize_key_dt(item.measured_at), _normalize_key_dt(ended_at))
+        if key in existing_map:
+            existing_sample = existing_map[key]
+            existing_sample.value, existing_sample.unit = item.value, item.unit
+            if item.extra:
+                existing_sample.extra = item.extra
+            continue
+        matched = _find_matching_scale_sample(existing_samples, st, item.measured_at) if st in scale_types else None
+        if matched is not None:
+            matched.value, matched.unit = item.value, item.unit
+            existing_map[key] = matched
+            continue
+        sample = HealthSample(
+            id=uuid.uuid4(), source=source, sample_type=st, measured_at=item.measured_at,
+            ended_at=ended_at, value=item.value, unit=item.unit,
+            external_id=item.external_id, extra=item.extra,
+        )
+        db.add(sample)
+        existing_map[key] = sample
+        existing_samples.append(sample)
+    return metrics_counts
+
+
 @router.post(
     "/apple-health/sync",
     response_model=AppleHealthSyncResponse,
@@ -355,105 +439,26 @@ def sync_apple_health_comprehensive(
     _: None = Depends(verify_webhook_token),
 ) -> AppleHealthSyncResponse:
     """Ingests multi-metric health samples with idempotent upsert and multi-day rollups."""
-    extra = getattr(payload, "__pydantic_extra__", {}) or {}
-    logger.info("Apple Health sync received. Extra keys: %s", list(extra.keys()))
-    for k, v in extra.items():
-        val_str = str(v)
-        preview = val_str[:120] + "..." if len(val_str) > 120 else val_str
-        logger.info("  Key [%s] (type %s): %s", k, type(v).__name__, preview)
-
+    _log_sync_extra_keys(getattr(payload, "__pydantic_extra__", {}) or {})
     items = payload.extract_all_samples()
     if not items:
         return AppleHealthSyncResponse(
-            status="empty",
-            total_samples_ingested=0,
-            metrics_summary={},
-            days_processed=[],
+            status="empty", total_samples_ingested=0, metrics_summary={}, days_processed=[]
         )
 
-    min_date = min(it.measured_at for it in items)
-    max_date = max((it.ended_at or it.measured_at) for it in items)
-
-    # Batch query existing samples in range for fast in-memory upsert (including cross-source scale samples)
-    existing_samples_in_range = list(
-        db.scalars(
-            select(HealthSample).where(
-                HealthSample.deleted_at.is_(None),
-                HealthSample.measured_at >= min_date - timedelta(seconds=60),
-                HealthSample.measured_at <= max_date + timedelta(seconds=60),
-            )
-        )
-    )
-    existing_map = {
-        (s.source, s.sample_type, _normalize_key_dt(s.measured_at), _normalize_key_dt(s.ended_at)): s
-        for s in existing_samples_in_range
-    }
-
-    scale_types = {"weight", "weight_kg", "body_fat_pct", "body_fat", "muscle_mass_kg", "water_pct", "bone_mass_kg"}
-
-    metrics_counts: dict[str, int] = {}
-    for item in items:
-        st = item.sample_type or "unknown"
-        metrics_counts[st] = metrics_counts.get(st, 0) + 1
-        ended_at = item.ended_at or item.measured_at
-        key = (item.source or payload.source, st, _normalize_key_dt(item.measured_at), _normalize_key_dt(ended_at))
-
-        if key in existing_map:
-            existing_sample = existing_map[key]
-            existing_sample.value = item.value
-            existing_sample.unit = item.unit
-            if item.extra:
-                existing_sample.extra = item.extra
-            continue
-
-        # Check cross-source scale deduplication (e.g. sample already exists from Withings within +-60s)
-        matched_scale_sample = None
-        if st in scale_types:
-            it_dt = item.measured_at if item.measured_at.tzinfo else item.measured_at.replace(tzinfo=timezone.utc)
-            for s in existing_samples_in_range:
-                s_dt = s.measured_at if s.measured_at.tzinfo else s.measured_at.replace(tzinfo=timezone.utc)
-                if s.sample_type == st and abs((s_dt - it_dt).total_seconds()) <= 60:
-                    matched_scale_sample = s
-                    break
-
-        if matched_scale_sample:
-            matched_scale_sample.value = item.value
-            matched_scale_sample.unit = item.unit
-            existing_map[key] = matched_scale_sample
-        else:
-            sample = HealthSample(
-                id=uuid.uuid4(),
-                source=item.source or payload.source,
-                sample_type=st,
-                measured_at=item.measured_at,
-                ended_at=ended_at,
-                value=item.value,
-                unit=item.unit,
-                external_id=item.external_id,
-                extra=item.extra,
-            )
-            db.add(sample)
-            existing_map[key] = sample
-            existing_samples_in_range.append(sample)
-
+    metrics_counts = _upsert_health_samples(db, items, payload.source)
     db.commit()
 
-    # Recalculate and update daily rollups for each distinct calendar day
     days = sorted(set(it.measured_at.date() for it in items))
     for d in days:
         _sync_daily_rollups(db, d)
-
     db.commit()
 
-    # Run workout detection for affected dates after daily rollups
     detected_workouts: list[DetectedWorkoutRead] = []
     for d in days:
-        day_workouts = detect_workouts_for_day(db, d)
-        detected_workouts.extend(day_workouts)
-
-    # Automatically sync detected and classified workouts to Kratos idempotently
+        detected_workouts.extend(detect_workouts_for_day(db, d))
     if detected_workouts:
-        sync_detected_workouts_to_kratos(detected_workouts)
+        sync_detected_workouts_to_kratos(detected_workouts, db=db)
 
     return AppleHealthSyncResponse(
         status="ok",
