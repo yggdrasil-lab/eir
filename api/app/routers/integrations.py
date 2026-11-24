@@ -414,6 +414,115 @@ async def _get_valid_withings_token(db: Session, user_id: str | None = None) -> 
     return token.access_token
 
 
+_WITHINGS_MEASURE_TYPES: dict[int, tuple[str, str]] = {
+    1: ("weight", "kg"),
+    6: ("body_fat_pct", "%"),
+    76: ("muscle_mass_kg", "kg"),
+    77: ("water_pct", "%"),
+    88: ("bone_mass_kg", "kg"),
+    11: ("resting_hr", "bpm"),
+}
+
+
+def _upsert_withings_measure(
+    db: Session,
+    grp_date: datetime,
+    grpid: Any,
+    attrib: Any,
+    measure: dict[str, Any],
+) -> bool:
+    m_type = measure.get("type")
+    if m_type not in _WITHINGS_MEASURE_TYPES:
+        return False
+    st_name, unit_str = _WITHINGS_MEASURE_TYPES[m_type]
+    val_raw = measure.get("value", 0)
+    unit_pow = measure.get("unit", 0)
+    calc_val = Decimal(str(val_raw)) * (Decimal(10) ** Decimal(str(unit_pow)))
+
+    existing = db.scalar(
+        select(HealthSample)
+        .where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type == st_name,
+            HealthSample.measured_at >= grp_date - timedelta(seconds=60),
+            HealthSample.measured_at <= grp_date + timedelta(seconds=60),
+        )
+        .order_by(HealthSample.measured_at.desc())
+        .limit(1)
+    )
+    if existing:
+        existing.value = calc_val
+        existing.unit = unit_str
+        existing.source = "withings"
+        if grpid:
+            existing.external_id = f"withings_{grpid}_{m_type}"
+        return False
+
+    db.add(
+        HealthSample(
+            id=uuid.uuid4(),
+            source="withings",
+            sample_type=st_name,
+            measured_at=grp_date,
+            ended_at=grp_date,
+            value=calc_val,
+            unit=unit_str,
+            external_id=f"withings_{grpid}_{m_type}" if grpid else None,
+            extra={"grpid": grpid, "attrib": attrib},
+        )
+    )
+    return True
+
+
+def _ingest_withings_measure_groups(
+    db: Session,
+    grps: list[dict[str, Any]],
+) -> int:
+    samples_created = 0
+    grp_dates: list[datetime] = []
+    for grp in grps:
+        grp_date = datetime.fromtimestamp(grp["date"], tz=timezone.utc)
+        grp_dates.append(grp_date)
+        for measure in grp.get("measures", []):
+            if _upsert_withings_measure(db, grp_date, grp.get("grpid"), grp.get("attrib"), measure):
+                samples_created += 1
+
+    db.commit()
+    if grp_dates:
+        DailyBiometrics(db).materialize_rollups(grp_dates)
+        db.commit()
+    return samples_created
+
+
+async def _fetch_and_ingest_withings_measures(
+    db: Session,
+    access_token: str,
+    startdate: Any,
+    enddate: Any,
+) -> int:
+    meas_params: dict[str, Any] = {"action": "getmeas", "category": 1}
+    if startdate:
+        meas_params["startdate"] = int(startdate)
+    if enddate:
+        meas_params["enddate"] = int(enddate)
+    else:
+        meas_params["startdate"] = int(datetime.now(timezone.utc).timestamp()) - 86400
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        meas_resp = await client.post(
+            "https://wbsapi.withings.net/measure",
+            headers={"Authorization": f"Bearer {access_token}"},
+            data=meas_params,
+        )
+    if meas_resp.status_code != 200:
+        return 0
+    meas_data = meas_resp.json()
+    if meas_data.get("status") != 0:
+        return 0
+    grps = meas_data.get("body", {}).get("measuregrps", [])
+    return _ingest_withings_measure_groups(db, grps)
+
+
 @router.post(
     "/withings/webhook",
     summary="Withings weigh-in notification callback",
@@ -423,104 +532,24 @@ async def withings_webhook_callback(
     db: Session = Depends(get_db),
 ):
     """Receives Withings notifications when a user steps on the scale, then fetches and ingests measurements."""
-    payload = {}
     content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        payload = await request.json()
-    else:
-        form = await request.form()
-        payload = dict(form)
+    payload = await request.json() if "application/json" in content_type else dict(await request.form())
 
     logger.info("Withings webhook callback received: %s", payload)
     appli = str(payload.get("appli", ""))
     user_id = str(payload.get("userid", ""))
-    startdate = payload.get("startdate")
-    enddate = payload.get("enddate")
 
     samples_created = 0
     if appli == "1":
-        access_token = await _get_valid_withings_token(db, user_id=user_id if user_id else None)
+        access_token = await _get_valid_withings_token(db, user_id=user_id or None)
         if access_token:
-            meas_params = {
-                "action": "getmeas",
-                "category": 1,
-            }
-            if startdate:
-                meas_params["startdate"] = int(startdate)
-            if enddate:
-                meas_params["enddate"] = int(enddate)
-            else:
-                meas_params["startdate"] = int(datetime.now(timezone.utc).timestamp()) - 86400
-
             try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    meas_resp = await client.post(
-                        "https://wbsapi.withings.net/measure",
-                        headers={"Authorization": f"Bearer {access_token}"},
-                        data=meas_params,
-                    )
-                    if meas_resp.status_code == 200:
-                        meas_data = meas_resp.json()
-                        if meas_data.get("status") == 0:
-                            body = meas_data.get("body", {})
-                            grps = body.get("measuregrps", [])
-                            grp_dates: list[datetime] = []
-                            type_map = {
-                                1: ("weight", "kg"),
-                                6: ("body_fat_pct", "%"),
-                                76: ("muscle_mass_kg", "kg"),
-                                77: ("water_pct", "%"),
-                                88: ("bone_mass_kg", "kg"),
-                                11: ("resting_hr", "bpm"),
-                            }
-                            for grp in grps:
-                                grp_date = datetime.fromtimestamp(grp["date"], tz=timezone.utc)
-                                grpid = grp.get("grpid")
-                                grp_dates.append(grp_date)
-
-                                for m in grp.get("measures", []):
-                                    m_type = m.get("type")
-                                    if m_type not in type_map:
-                                        continue
-                                    st_name, unit_str = type_map[m_type]
-                                    val_raw = m.get("value", 0)
-                                    unit_pow = m.get("unit", 0)
-                                    calc_val = Decimal(str(val_raw)) * (Decimal(10) ** Decimal(str(unit_pow)))
-
-                                    # Cross-source deduplication (+-60s window)
-                                    existing = db.scalar(
-                                        select(HealthSample).where(
-                                            HealthSample.deleted_at.is_(None),
-                                            HealthSample.sample_type == st_name,
-                                            HealthSample.measured_at >= grp_date - timedelta(seconds=60),
-                                            HealthSample.measured_at <= grp_date + timedelta(seconds=60),
-                                        ).order_by(HealthSample.measured_at.desc()).limit(1)
-                                    )
-                                    if existing:
-                                        existing.value = calc_val
-                                        existing.unit = unit_str
-                                        existing.source = "withings"
-                                        if grpid:
-                                            existing.external_id = f"withings_{grpid}_{m_type}"
-                                    else:
-                                        sample = HealthSample(
-                                            id=uuid.uuid4(),
-                                            source="withings",
-                                            sample_type=st_name,
-                                            measured_at=grp_date,
-                                            ended_at=grp_date,
-                                            value=calc_val,
-                                            unit=unit_str,
-                                            external_id=f"withings_{grpid}_{m_type}" if grpid else None,
-                                            extra={"grpid": grpid, "attrib": grp.get("attrib")},
-                                        )
-                                        db.add(sample)
-                                        samples_created += 1
-
-                            db.commit()
-                            if grp_dates:
-                                DailyBiometrics(db).materialize_rollups(grp_dates)
-                                db.commit()
+                samples_created = await _fetch_and_ingest_withings_measures(
+                    db,
+                    access_token,
+                    payload.get("startdate"),
+                    payload.get("enddate"),
+                )
             except Exception as exc:
                 logger.error("Failed to query Withings measure API: %s", exc)
 
