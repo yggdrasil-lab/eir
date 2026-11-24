@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import get_db
 from app.models import BiometricMeasurement, HealthSample, OAuthToken
-from app.routers.biometrics import detect_workouts_for_day
+from app.exertion import ExertionAnalyzer
 from app.services.biometrics import deduplicate_step_samples
 from app.services.kratos_sync import sync_detected_workouts_to_kratos
 from app.schemas import (
@@ -210,7 +210,7 @@ def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
             HealthSample.measured_at <= end_dt,
         )
     )
-    detected_for_day = detect_workouts_for_day(db, target_date)
+    detected_for_day = ExertionAnalyzer(db).detect_day(target_date)
     detected_energy_total = sum(w.active_energy_kcal for w in detected_for_day)
     if energy_kcal is not None and detected_energy_total > float(energy_kcal):
         energy_kcal = Decimal(detected_energy_total)
@@ -456,7 +456,7 @@ def sync_apple_health_comprehensive(
 
     detected_workouts: list[DetectedWorkoutRead] = []
     for d in days:
-        detected_workouts.extend(detect_workouts_for_day(db, d))
+        detected_workouts.extend(ExertionAnalyzer(db).detect_day(d))
     if detected_workouts:
         sync_detected_workouts_to_kratos(detected_workouts, db=db)
 

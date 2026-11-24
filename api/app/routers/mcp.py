@@ -271,7 +271,7 @@ def build_mcp_server() -> MCPServer:
         activity_type: str | None = None,
         routine_name: str | None = None,
     ) -> str:
-        from app.routers.biometrics import compute_workout_metrics_for_window
+        from app.exertion import ExertionAnalyzer, InvalidWindowError
 
         try:
             s_dt = datetime.fromisoformat(started_at)
@@ -279,18 +279,17 @@ def build_mcp_server() -> MCPServer:
         except ValueError as exc:
             raise ToolError(f"Invalid ISO-8601 timestamp: {exc}") from exc
 
-        if e_dt <= s_dt:
-            raise ToolError("ended_at must be after started_at")
-
         with mcp_session() as db:
-            result = compute_workout_metrics_for_window(
-                db,
-                started_at=s_dt,
-                ended_at=e_dt,
-                classification=classification,
-                activity_type=activity_type,
-                routine_name=routine_name,
-            )
+            try:
+                result = ExertionAnalyzer(db).analyze_window(
+                    s_dt,
+                    e_dt,
+                    classification=classification,
+                    activity_type=activity_type,
+                    routine_name=routine_name,
+                )
+            except InvalidWindowError as exc:
+                raise ToolError(str(exc)) from exc
             return result.model_dump_json()
 
     return server
