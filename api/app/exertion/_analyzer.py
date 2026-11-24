@@ -69,7 +69,6 @@ class ExertionAnalyzer:
         s_time, e_time = normalize_window_bounds(started_at, ended_at, self._profile.tz)
         samples = fetch_exertion_samples(self._db, s_time, e_time + timedelta(seconds=90))
         bucketed = bucket_samples_into_5min_slots(samples, s_time, e_time, self._profile.tz)
-
         duration_mins = max(1, int(round((e_time - s_time).total_seconds() / 60)))
         block_energy = sum((slot.energy for slot in bucketed.slots), Decimal(0))
         block_steps = sum((slot.steps for slot in bucketed.slots), Decimal(0))
@@ -82,28 +81,14 @@ class ExertionAnalyzer:
         avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
         peak_hr = int(round(max(all_hrs))) if all_hrs else None
         pattern = self._resolve_window_pattern(
-            slots=bucketed.slots,
-            duration_mins=duration_mins,
-            block_energy=block_energy,
-            avg_hr=avg_hr,
-            peak_hr=peak_hr,
-            all_hrs=all_hrs,
-            block_steps=block_steps,
-            classification=classification,
-            activity_type=activity_type,
-            routine_name=routine_name,
+            slots=bucketed.slots, duration_mins=duration_mins, block_energy=block_energy,
+            avg_hr=avg_hr, peak_hr=peak_hr, all_hrs=all_hrs, block_steps=block_steps,
+            classification=classification, activity_type=activity_type, routine_name=routine_name,
         )
         return self._build_detected_workout(
-            s_time=s_time,
-            e_time=e_time,
-            end_dt=e_time,
-            duration_mins=duration_mins,
-            block_energy=block_energy,
-            all_hrs=all_hrs,
-            block_steps=block_steps,
-            samples=samples,
-            pattern=pattern,
-            confidence="high",
+            s_time=s_time, e_time=e_time, end_dt=e_time, duration_mins=duration_mins,
+            block_energy=block_energy, all_hrs=all_hrs, block_steps=block_steps,
+            samples=samples, pattern=pattern, confidence="high",
         )
 
     def build_timeline(self, started_at: datetime, ended_at: datetime) -> WorkoutTimelineRead:
@@ -161,32 +146,19 @@ class ExertionAnalyzer:
         all_hrs = [hr for slot in cluster_slots for hr in slot.hr_values]
         avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
         peak_hr = int(round(max(all_hrs))) if all_hrs else None
-        if not passes_cluster_noise_filter(
-            duration_mins, block_energy, block_steps, all_hrs, avg_hr, peak_hr
-        ):
+        if not passes_cluster_noise_filter(duration_mins, block_energy, block_steps, all_hrs, avg_hr, peak_hr):
             return None
 
         pattern = classify_activity_pattern(
-            slots=cluster_slots,
-            duration_mins=duration_mins,
-            block_energy=block_energy,
-            avg_hr=avg_hr,
-            peak_hr=peak_hr,
-            all_hrs=all_hrs,
-            block_steps=block_steps,
+            slots=cluster_slots, duration_mins=duration_mins, block_energy=block_energy,
+            avg_hr=avg_hr, peak_hr=peak_hr, all_hrs=all_hrs, block_steps=block_steps,
         )
         conf = "high" if (avg_hr and avg_hr >= 130 and block_energy >= Decimal(350)) else "medium"
         return self._build_detected_workout(
             s_time=start_dt + timedelta(minutes=start_idx * 5),
             e_time=start_dt + timedelta(minutes=(end_idx + 1) * 5),
-            end_dt=end_dt,
-            duration_mins=duration_mins,
-            block_energy=block_energy,
-            all_hrs=all_hrs,
-            block_steps=block_steps,
-            samples=samples,
-            pattern=pattern,
-            confidence=conf,
+            end_dt=end_dt, duration_mins=duration_mins, block_energy=block_energy,
+            all_hrs=all_hrs, block_steps=block_steps, samples=samples, pattern=pattern, confidence=conf,
         )
 
     def _build_detected_workout(
@@ -205,41 +177,20 @@ class ExertionAnalyzer:
     ) -> DetectedWorkoutRead:
         avg_hr = int(round(sum(all_hrs) / len(all_hrs))) if all_hrs else None
         peak_hr = int(round(max(all_hrs))) if all_hrs else None
-        final_energy_kcal = self._resolve_active_energy(
-            duration_mins=duration_mins,
-            avg_hr=avg_hr,
-            block_energy=block_energy,
-            end_dt=end_dt,
-            classification=pattern.classification,
+        final_energy = self._resolve_active_energy(
+            duration_mins=duration_mins, avg_hr=avg_hr, block_energy=block_energy,
+            end_dt=end_dt, classification=pattern.classification,
         )
-        exertion = compute_workout_exertion_metrics(
-            all_hrs=all_hrs,
-            duration_mins=duration_mins,
-            max_hr=self._profile.max_hr,
-        )
-        hr_recovery_60s = compute_hr_recovery_60s(
-            samples=samples,
-            e_time=e_time,
-            all_hrs=all_hrs,
-            tz=self._profile.tz,
-        )
+        exertion = compute_workout_exertion_metrics(all_hrs, duration_mins, max_hr=self._profile.max_hr)
+        hr_rec = compute_hr_recovery_60s(samples, e_time, all_hrs, self._profile.tz)
         return DetectedWorkoutRead(
-            started_at=s_time,
-            ended_at=e_time,
-            duration_minutes=duration_mins,
-            active_energy_kcal=final_energy_kcal,
-            avg_hr_bpm=avg_hr,
-            peak_hr_bpm=peak_hr,
+            started_at=s_time, ended_at=e_time, duration_minutes=duration_mins,
+            active_energy_kcal=final_energy, avg_hr_bpm=avg_hr, peak_hr_bpm=peak_hr,
             step_count=int(round(block_steps)) if block_steps > 0 else None,
-            confidence=confidence,
-            classification=pattern.classification,
-            activity_type=pattern.activity_type,
-            routine_name=pattern.routine_name,
-            effort_rating=exertion.effort_rating,
-            rpe=exertion.rpe,
-            trimp=exertion.trimp,
-            hr_zones=exertion.hr_zones,
-            hr_recovery_60s=hr_recovery_60s,
+            confidence=confidence, classification=pattern.classification,
+            activity_type=pattern.activity_type, routine_name=pattern.routine_name,
+            effort_rating=exertion.effort_rating, rpe=exertion.rpe, trimp=exertion.trimp,
+            hr_zones=exertion.hr_zones, hr_recovery_60s=hr_rec,
         )
 
     def _resolve_active_energy(

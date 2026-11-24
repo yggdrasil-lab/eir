@@ -67,11 +67,9 @@ def compute_workout_exertion_metrics(
     if not all_hrs:
         return ExertionScore(effort_rating="optimal", rpe=6.0, trimp=0.0, hr_zones=None)
 
-    z1_max = float(round(max_hr * 0.60))
-    z2_max = float(round(max_hr * 0.70))
-    z3_max = float(round(max_hr * 0.80))
-    z4_max = float(round(max_hr * 0.90))
-
+    z1_max, z2_max, z3_max, z4_max = (
+        float(round(max_hr * ratio)) for ratio in (0.60, 0.70, 0.80, 0.90)
+    )
     total_pts = len(all_hrs)
     avg_hr = sum(all_hrs) / total_pts
     counts = (
@@ -84,20 +82,14 @@ def compute_workout_exertion_metrics(
     pcts = tuple(round((c / total_pts) * 100.0, 1) for c in counts)
     mins = tuple(round((c / total_pts) * duration_mins, 1) for c in counts)
     trimp = round(sum(m * weight for m, weight in zip(mins, (1.0, 2.0, 3.0, 4.0, 5.0))), 1)
-    effort_rating, rpe = _classify_effort_and_rpe(
-        pcts[2], pcts[3], pcts[4], avg_hr, duration_mins
+    effort_rating, rpe = _classify_effort_and_rpe(pcts[2], pcts[3], pcts[4], avg_hr, duration_mins)
+    zone_keys = (
+        ("z1_recovery_pct", "z1_mins"), ("z2_aerobic_pct", "z2_mins"),
+        ("z3_tempo_pct", "z3_mins"), ("z4_threshold_pct", "z4_mins"), ("z5_anaerobic_pct", "z5_mins"),
     )
     hr_zones = {
-        "z1_recovery_pct": pcts[0],
-        "z2_aerobic_pct": pcts[1],
-        "z3_tempo_pct": pcts[2],
-        "z4_threshold_pct": pcts[3],
-        "z5_anaerobic_pct": pcts[4],
-        "z1_mins": mins[0],
-        "z2_mins": mins[1],
-        "z3_mins": mins[2],
-        "z4_mins": mins[3],
-        "z5_mins": mins[4],
+        **{k_pct: pct for (k_pct, _), pct in zip(zone_keys, pcts)},
+        **{k_min: m for (_, k_min), m in zip(zone_keys, mins)},
     }
     return ExertionScore(effort_rating=effort_rating, rpe=rpe, trimp=trimp, hr_zones=hr_zones)
 

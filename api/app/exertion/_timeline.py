@@ -84,39 +84,23 @@ def _resolve_active_to_passive(
     gap_end = idx
     while gap_end < len(bins) and (gap_end - idx) < 2 and gap_flags[gap_end]:
         gap_end += 1
-
     if gap_end >= len(bins):
         return None, len(bins)
 
     if bins[gap_end].is_active_watch_mode:
         if gap_end == idx:
             return None, idx + 1
-        split = SuggestedSplitRead(
-            split_at=bins[idx].started_at,
-            resume_at=bins[gap_end].started_at,
-            reason="Active Watch workout mode resumed after transition gap",
-            confidence="high",
-        )
-        return split, gap_end + 1
+        reason = "Active Watch workout mode resumed after transition gap"
+        return SuggestedSplitRead(split_at=bins[idx].started_at, resume_at=bins[gap_end].started_at, reason=reason, confidence="high"), gap_end + 1
 
     if gap_end == idx:
-        split = SuggestedSplitRead(
-            split_at=bins[idx].started_at,
-            resume_at=bins[idx].started_at,
-            reason="Active Watch workout mode ended while passive exertion continued",
-            confidence="high",
-        )
-        return split, idx + 1
+        reason = "Active Watch workout mode ended while passive exertion continued"
+        return SuggestedSplitRead(split_at=bins[idx].started_at, resume_at=bins[idx].started_at, reason=reason, confidence="high"), idx + 1
 
     if not any(not is_gap for is_gap in gap_flags[gap_end:]):
         return None, len(bins)
-    split = SuggestedSplitRead(
-        split_at=bins[idx].started_at,
-        resume_at=bins[gap_end].started_at,
-        reason="Active Watch workout mode ended before transition gap",
-        confidence="high",
-    )
-    return split, gap_end + 1
+    reason = "Active Watch workout mode ended before transition gap"
+    return SuggestedSplitRead(split_at=bins[idx].started_at, resume_at=bins[gap_end].started_at, reason=reason, confidence="high"), gap_end + 1
 
 
 def suggest_timeline_splits(

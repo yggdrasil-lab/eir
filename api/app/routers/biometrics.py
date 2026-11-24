@@ -62,29 +62,11 @@ def get_latest_biometrics(
     return db.scalar(stmt)
 
 
-@router.get("/daily/{target_date}", response_model=DailyBiometricSummary)
-def get_daily_summary(
-    target_date: date,
-    db: Session = Depends(get_db),
-) -> DailyBiometricSummary:
-    """Aggregates all biometric readings for a single calendar day."""
-    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
-    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
-
-    stmt = (
-        select(BiometricMeasurement)
-        .where(
-            BiometricMeasurement.deleted_at.is_(None),
-            BiometricMeasurement.measured_at >= start_dt,
-            BiometricMeasurement.measured_at <= end_dt,
-        )
-        .order_by(BiometricMeasurement.measured_at.asc())
-    )
-    records = list(db.scalars(stmt))
-
-    summary = DailyBiometricSummary(date=target_date)
-    readiness_notes = []
-
+def _apply_measurement_rollups(
+    summary: DailyBiometricSummary,
+    records: list[BiometricMeasurement],
+) -> list[str]:
+    readiness_notes: list[str] = []
     for r in records:
         if r.weight_kg is not None:
             summary.latest_weight_kg = r.weight_kg
@@ -106,103 +88,62 @@ def get_daily_summary(
             summary.step_count = (summary.step_count or 0) + r.step_count
         if r.active_energy_kcal is not None:
             summary.active_energy_kcal = (summary.active_energy_kcal or 0) + r.active_energy_kcal
-        if r.extra:
-            if "wrist_temperature_c" in r.extra:
-                summary.wrist_temperature_c = r.extra["wrist_temperature_c"]
-            if "respiratory_rate_bpm" in r.extra:
-                summary.respiratory_rate_bpm = r.extra["respiratory_rate_bpm"]
-            if "oxygen_saturation_pct" in r.extra:
-                summary.oxygen_saturation_pct = r.extra["oxygen_saturation_pct"]
-            if "walking_asymmetry_pct" in r.extra:
-                summary.walking_asymmetry_pct = r.extra["walking_asymmetry_pct"]
-            if "vo2_max" in r.extra:
-                summary.vo2_max = r.extra["vo2_max"]
+        _apply_measurement_extras(summary, r.extra)
         if r.notes:
             readiness_notes.append(r.notes)
+    return readiness_notes
 
-    # Granular samples take precedence if recorded for this day
-    granular_active_energy = db.scalar(
-        select(func.sum(HealthSample.value)).where(
+
+def _apply_measurement_extras(summary: DailyBiometricSummary, extra: dict | None) -> None:
+    if not extra:
+        return
+    extra_fields = (
+        "wrist_temperature_c",
+        "respiratory_rate_bpm",
+        "oxygen_saturation_pct",
+        "walking_asymmetry_pct",
+        "vo2_max",
+    )
+    for key in extra_fields:
+        if key in extra:
+            setattr(summary, key, extra[key])
+
+
+def _avg_sample_in_window(
+    db: Session,
+    sample_types: list[str],
+    start_dt: datetime,
+    end_dt: datetime,
+    digits: int,
+) -> float | None:
+    val = db.scalar(
+        select(func.avg(HealthSample.value)).where(
             HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type == "active_energy",
+            HealthSample.sample_type.in_(sample_types),
             HealthSample.measured_at >= start_dt,
             HealthSample.measured_at <= end_dt,
         )
     )
-    if granular_active_energy is not None:
-        summary.active_energy_kcal = int(round(granular_active_energy))
+    return round(float(val), digits) if val is not None else None
 
-    # Step count comes from BiometricMeasurement rollup or deduplicated granular samples
-    if summary.step_count is None:
-        raw_steps = list(
-            db.scalars(
-                select(HealthSample).where(
-                    HealthSample.deleted_at.is_(None),
-                    HealthSample.sample_type.in_(["step_count", "steps"]),
-                    HealthSample.measured_at >= start_dt,
-                    HealthSample.measured_at <= end_dt,
-                )
-            )
-        )
-        if raw_steps:
-            summary.step_count = int(round(deduplicate_step_samples(raw_steps)))
 
-    # Granular sample aggregations for new health metrics if missing
-    if summary.wrist_temperature_c is None:
-        wt = db.scalar(
-            select(func.avg(HealthSample.value)).where(
-                HealthSample.deleted_at.is_(None),
-                HealthSample.sample_type.in_(["wrist_temperature", "wrist_temp", "wrist_temperature_c"]),
-                HealthSample.measured_at >= start_dt,
-                HealthSample.measured_at <= end_dt,
-            )
-        )
-        if wt is not None:
-            summary.wrist_temperature_c = round(float(wt), 2)
-
-    if summary.respiratory_rate_bpm is None:
-        rr = db.scalar(
-            select(func.avg(HealthSample.value)).where(
-                HealthSample.deleted_at.is_(None),
-                HealthSample.sample_type.in_(["respiratory_rate", "sleeping_respiratory_rate", "respiratory_rate_bpm"]),
-                HealthSample.measured_at >= start_dt,
-                HealthSample.measured_at <= end_dt,
-            )
-        )
-        if rr is not None:
-            summary.respiratory_rate_bpm = round(float(rr), 1)
-
-    if summary.oxygen_saturation_pct is None:
-        ox = db.scalar(
-            select(func.avg(HealthSample.value)).where(
-                HealthSample.deleted_at.is_(None),
-                HealthSample.sample_type.in_(["oxygen_saturation", "spo2", "blood_oxygen"]),
-                HealthSample.measured_at >= start_dt,
-                HealthSample.measured_at <= end_dt,
-            )
-        )
-        if ox is not None:
-            summary.oxygen_saturation_pct = round(float(ox), 1)
-
-    if summary.walking_asymmetry_pct is None:
-        wa = db.scalar(
-            select(func.avg(HealthSample.value)).where(
-                HealthSample.deleted_at.is_(None),
-                HealthSample.sample_type.in_([
-                    "walking_asymmetry",
-                    "walking_ asymmetry",
-                    "walking asymmetry",
-                    "walking_asymmetry_percentage",
-                ]),
-                HealthSample.measured_at >= start_dt,
-                HealthSample.measured_at <= end_dt,
-            )
-        )
-        if wa is not None:
-            summary.walking_asymmetry_pct = round(float(wa), 2)
+def _fill_granular_summary_fallbacks(
+    db: Session,
+    summary: DailyBiometricSummary,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> None:
+    avg_specs = (
+        ("wrist_temperature_c", ["wrist_temperature", "wrist_temp", "wrist_temperature_c"], 2),
+        ("respiratory_rate_bpm", ["respiratory_rate", "sleeping_respiratory_rate", "respiratory_rate_bpm"], 1),
+        ("oxygen_saturation_pct", ["oxygen_saturation", "spo2", "blood_oxygen"], 1),
+        ("walking_asymmetry_pct", ["walking_asymmetry", "walking_ asymmetry", "walking asymmetry", "walking_asymmetry_percentage"], 2),
+    )
+    for attr, sample_types, digits in avg_specs:
+        if getattr(summary, attr) is None:
+            setattr(summary, attr, _avg_sample_in_window(db, sample_types, start_dt, end_dt, digits))
 
     if summary.vo2_max is None:
-        # Fall back to latest known VO2 max measurement on or before target date
         vm = db.scalar(
             select(HealthSample.value)
             .where(
@@ -217,7 +158,7 @@ def get_daily_summary(
             summary.vo2_max = round(float(vm), 1)
 
     if summary.sleep_rem_hours is None:
-        sleep_samples_for_day = list(
+        sleep_samples = list(
             db.scalars(
                 select(HealthSample).where(
                     HealthSample.deleted_at.is_(None),
@@ -228,24 +169,76 @@ def get_daily_summary(
             )
         )
         rem_total = sum(
-            (float(s.value) for s in sleep_samples_for_day if str((s.extra or {}).get("stage") or "").lower() == "rem"),
+            (float(s.value) for s in sleep_samples if str((s.extra or {}).get("stage") or "").lower() == "rem"),
             0.0,
         )
         if rem_total > 0:
             summary.sleep_rem_hours = round(rem_total / 3600.0, 2)
 
-    # Active feedbacks for this day
+
+def _fill_daily_energy_and_steps(
+    db: Session,
+    summary: DailyBiometricSummary,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> None:
+    granular_energy = db.scalar(
+        select(func.sum(HealthSample.value)).where(
+            HealthSample.deleted_at.is_(None),
+            HealthSample.sample_type == "active_energy",
+            HealthSample.measured_at >= start_dt,
+            HealthSample.measured_at <= end_dt,
+        )
+    )
+    if granular_energy is not None:
+        summary.active_energy_kcal = int(round(granular_energy))
+
+    if summary.step_count is None:
+        raw_steps = list(
+            db.scalars(
+                select(HealthSample).where(
+                    HealthSample.deleted_at.is_(None),
+                    HealthSample.sample_type.in_(["step_count", "steps"]),
+                    HealthSample.measured_at >= start_dt,
+                    HealthSample.measured_at <= end_dt,
+                )
+            )
+        )
+        if raw_steps:
+            summary.step_count = int(round(deduplicate_step_samples(raw_steps)))
+
+
+@router.get("/daily/{target_date}", response_model=DailyBiometricSummary)
+def get_daily_summary(
+    target_date: date,
+    db: Session = Depends(get_db),
+) -> DailyBiometricSummary:
+    """Aggregates all biometric readings for a single calendar day."""
+    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
+    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
+    records = list(
+        db.scalars(
+            select(BiometricMeasurement)
+            .where(
+                BiometricMeasurement.deleted_at.is_(None),
+                BiometricMeasurement.measured_at >= start_dt,
+                BiometricMeasurement.measured_at <= end_dt,
+            )
+            .order_by(BiometricMeasurement.measured_at.asc())
+        )
+    )
+    summary = DailyBiometricSummary(date=target_date)
+    readiness_notes = _apply_measurement_rollups(summary, records)
+    _fill_daily_energy_and_steps(db, summary, start_dt, end_dt)
+    _fill_granular_summary_fallbacks(db, summary, start_dt, end_dt)
+
     feedback_stmt = select(HealthFeedback).where(
         HealthFeedback.deleted_at.is_(None),
         HealthFeedback.date == target_date,
     )
     for fb in db.scalars(feedback_stmt):
-        if fb.feedback_type == "fasting":
-            summary.fasting = fb
-        elif fb.feedback_type == "workout":
-            summary.workout = fb
-        elif fb.feedback_type == "wellness":
-            summary.wellness = fb
+        if fb.feedback_type in ("fasting", "workout", "wellness"):
+            setattr(summary, fb.feedback_type, fb)
 
     summary.readiness_notes = readiness_notes
     summary.detected_workouts = ExertionAnalyzer(db).detect_day(target_date)
