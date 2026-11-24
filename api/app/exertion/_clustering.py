@@ -131,7 +131,12 @@ def passes_cluster_noise_filter(
     hr_spread = (max(all_hrs) - min(all_hrs)) if all_hrs else 0.0
     cadence = float(block_steps) / duration_mins if duration_mins > 0 else 0.0
     is_high_intensity = duration_mins >= 30 and (block_energy >= Decimal(250) or (avg_hr is not None and avg_hr >= 120))
-    is_sustained_walk = duration_mins >= 15 and block_steps >= Decimal(900) and (avg_hr is None or avg_hr >= 90)
+    is_sustained_walk = (
+        duration_mins >= 15
+        and block_steps >= Decimal(900)
+        and cadence >= 60.0
+        and (avg_hr is None or avg_hr >= 90)
+    )
     is_resistance = duration_mins >= 30 and block_energy >= Decimal(120) and (hr_spread >= 20 or (peak_hr is not None and peak_hr >= 115))
     is_swim = duration_mins >= 20 and block_energy >= Decimal(100) and (avg_hr is not None and avg_hr >= 110) and cadence < 25.0
     return is_high_intensity or is_sustained_walk or is_resistance or is_swim

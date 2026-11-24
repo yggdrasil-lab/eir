@@ -27,8 +27,8 @@ def normalize_window_bounds(
     tz: tzinfo,
 ) -> tuple[datetime, datetime]:
     """Normalizes window timestamps to tz and validates chronological ordering."""
-    s_time = started_at.astimezone(tz) if started_at.tzinfo else started_at.replace(tzinfo=tz)
-    e_time = ended_at.astimezone(tz) if ended_at.tzinfo else ended_at.replace(tzinfo=tz)
+    s_time = _to_local_dt(started_at, tz)
+    e_time = _to_local_dt(ended_at, tz)
     if e_time <= s_time:
         raise InvalidWindowError("ended_at must be after started_at")
     return s_time, e_time
@@ -78,15 +78,14 @@ def _step_sample_in_window(
 
 
 def _prorate_step_interval(
-    sample: HealthSample,
+    value: Decimal,
+    s_start: datetime,
+    s_end: datetime,
     step_totals: list[Decimal],
     start_dt: datetime,
     window_end: datetime,
-    tz: tzinfo,
     num_slots: int,
 ) -> None:
-    s_start = _to_local_dt(sample.measured_at, tz)
-    s_end = _to_local_dt(sample.ended_at, tz)  # type: ignore[arg-type]
     clamped_start = max(s_start, start_dt)
     clamped_end = min(s_end, window_end)
     if clamped_end <= clamped_start:
@@ -101,7 +100,7 @@ def _prorate_step_interval(
         return
 
     fully_inside = s_start >= start_dt and s_end <= window_end
-    target_total = sample.value if fully_inside else (sample.value * Decimal(overlap_us) / Decimal(total_us))
+    target_total = value if fully_inside else (value * Decimal(overlap_us) / Decimal(total_us))
     allocated = Decimal(0)
     for idx in range(first_idx, last_idx + 1):
         if idx == last_idx:
@@ -112,7 +111,7 @@ def _prorate_step_interval(
         slot_ov_us = _duration_us(min(clamped_end, slot_end) - max(clamped_start, slot_start))
         if slot_ov_us <= 0:
             continue
-        share = sample.value * Decimal(slot_ov_us) / Decimal(total_us)
+        share = value * Decimal(slot_ov_us) / Decimal(total_us)
         step_totals[idx] += share
         allocated += share
 
@@ -130,7 +129,7 @@ def _accumulate_step_sample(
     s_end = _to_local_dt(sample.ended_at, tz) if sample.ended_at is not None else None
     if s_end is not None and s_end > s_start:
         window_end = min(end_dt, start_dt + timedelta(seconds=num_slots * SLOT_SECONDS))
-        _prorate_step_interval(sample, step_totals, start_dt, window_end, tz, num_slots)
+        _prorate_step_interval(sample.value, s_start, s_end, step_totals, start_dt, window_end, num_slots)
         return
     if not _in_bucket_bounds(s_start, start_dt, end_dt, inclusive_end):
         return

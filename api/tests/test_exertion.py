@@ -410,6 +410,22 @@ class TestExertionDeepModule(unittest.TestCase):
         self.assertEqual(badmin_res[0].classification, "badminton")
         self.assertEqual(badmin_res[0].routine_name, "Badminton Match Play")
 
+    def test_slow_25m_sub60_spm_cluster_stays_filtered_not_gym(self):
+        nz_tz = ZoneInfo("Pacific/Auckland")
+        analyzer = ExertionAnalyzer(self.db, ExertionProfile(tz=nz_tz, max_hr=186))
+        target_day = date(2026, 11, 25)
+        start = datetime(2026, 11, 25, 11, 20, tzinfo=nz_tz)
+
+        # 25 min with 950 steps (38 spm < 60 spm) and low active energy -> must NOT trigger walk or gym
+        for i in range(5):
+            t = start + timedelta(minutes=i * 5)
+            self._add_sample(sample_type="active_energy", measured_at=t, value=Decimal("8"), unit="kcal")
+            self._add_sample(sample_type="heart_rate", measured_at=t, value=Decimal("108"), unit="bpm")
+            self._add_sample(sample_type="step_count", measured_at=t, value=Decimal("190"), unit="count")
+        self.db.commit()
+
+        self.assertEqual(analyzer.detect_day(target_day), [])
+
 
 if __name__ == "__main__":
     unittest.main()
