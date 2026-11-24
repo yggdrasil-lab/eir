@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 import logging
 import uuid
 
@@ -13,6 +14,7 @@ from app.exertion import ExertionAnalyzer
 from app.kratos_sync._http_store import HttpKratosSessionStore
 from app.kratos_sync._overlap import (
     _OverlapCandidate,
+    _SyncScanResult,
     scan_existing_sessions,
     session_window_utc,
     to_utc_dt,
@@ -258,10 +260,10 @@ class KratosReconciler:
         store: KratosSessionStore,
         workout: DetectedWorkoutRead,
         session_id: uuid.UUID,
-        w_start_utc: Any,
-        w_end_utc: Any,
+        w_start_utc: datetime,
+        w_end_utc: datetime,
         w_duration: float,
-        scan: Any,
+        scan: _SyncScanResult,
         working_sessions: list[KratosSession],
     ) -> SyncOutcome:
         matched = scan.exact_inferred or scan.best_inferred or store.get_session(str(session_id))
