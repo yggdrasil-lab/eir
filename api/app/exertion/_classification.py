@@ -92,20 +92,43 @@ def _is_swim_pattern(
     return max_consecutive >= 2 and (minimal_slots / len(slots)) >= 0.50
 
 
+def _has_declining_or_steady_hr(slots: Sequence[SampleSlot]) -> bool:
+    slot_avgs = [
+        sum(slot.hr_values) / len(slot.hr_values)
+        for slot in slots
+        if slot.hr_values
+    ]
+    if len(slot_avgs) < 2:
+        return True
+    tail_avg = sum(slot_avgs[1:]) / (len(slot_avgs) - 1)
+    return tail_avg <= slot_avgs[0] + 5.0
+
+
 def _is_walk_pattern(
+    slots: Sequence[SampleSlot],
     cadence: float,
     has_warmup_jog: bool,
     avg_hr: int | None,
     peak_hr: int | None,
     has_rest_break: bool,
 ) -> bool:
-    return (
+    if has_warmup_jog or has_rest_break:
+        return False
+    is_low_hr_walk = (
         cadence > 50.0
-        and not has_warmup_jog
         and (avg_hr is None or avg_hr <= 120)
         and (peak_hr is None or peak_hr <= 135)
-        and not has_rest_break
     )
+    is_elevated_steady_walk = (
+        cadence >= 58.0
+        and (avg_hr is None or avg_hr <= 138)
+        and (
+            peak_hr is None
+            or peak_hr <= 153
+            or (peak_hr <= 156 and _has_declining_or_steady_hr(slots))
+        )
+    )
+    return is_low_hr_walk or is_elevated_steady_walk
 
 
 def _is_badminton_pattern(
@@ -118,8 +141,9 @@ def _is_badminton_pattern(
 ) -> bool:
     if has_warmup_jog or avg_hr is None:
         return False
-    has_court_hr = avg_hr >= 132 or (avg_hr >= 128 and peak_hr is not None and peak_hr >= 155)
-    if not has_court_hr:
+    if avg_hr >= 140 and (peak_hr is None or peak_hr >= 154) and cadence >= 24.5:
+        return True
+    if avg_hr < 132:
         return False
     return (
         cadence >= 40.0
@@ -147,10 +171,10 @@ def classify_activity_pattern(
 
     if _is_swim_pattern(slots, duration_mins, block_energy, avg_hr, cadence, has_warmup_jog):
         return _SWIM_PATTERN
-    if _is_walk_pattern(cadence, has_warmup_jog, avg_hr, peak_hr, has_rest_break):
+    if _is_walk_pattern(slots, cadence, has_warmup_jog, avg_hr, peak_hr, has_rest_break):
         return _WALK_PATTERN
     if _is_badminton_pattern(cadence, burst_slots, has_warmup_jog, has_rest_break, avg_hr, peak_hr):
         return _BADMINTON_PATTERN
-    if (cadence < 50.0 or has_warmup_jog) and (hr_range >= 20.0 or has_warmup_jog or cadence < 30.0):
+    if (cadence < 58.0 or has_warmup_jog) and (hr_range >= 20.0 or has_warmup_jog or cadence < 30.0):
         return _GYM_PATTERN
     return _WALK_PATTERN if cadence > 50.0 else _GYM_PATTERN
