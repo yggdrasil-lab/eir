@@ -21,7 +21,7 @@ from app.config import settings
 from app.daily_biometrics import DailyBiometrics
 from app.db import get_db
 from app.models import BiometricMeasurement, HealthSample, OAuthToken
-from app.services.kratos_sync import sync_detected_workouts_to_kratos
+from app.kratos_sync import KratosReconciler
 from app.schemas import (
     AppleHealthComprehensiveSyncPayload,
     AppleHealthSyncResponse,
@@ -187,7 +187,7 @@ def sync_apple_health_comprehensive(
 
     detected_workouts = list(batch.detected_workouts)
     if detected_workouts:
-        sync_detected_workouts_to_kratos(detected_workouts, db=db)
+        KratosReconciler(db).sync(detected_workouts)
 
     return AppleHealthSyncResponse(
         status="ok",
