@@ -22,6 +22,14 @@ def _step_sample_interval(sample: HealthSample) -> tuple[datetime, datetime]:
     return start, start + timedelta(seconds=300)
 
 
+def _intervals_overlap(
+    start_a: datetime,
+    end_a: datetime,
+    watch_intervals: Sequence[tuple[datetime, datetime]],
+) -> bool:
+    return any(max(start_a, w_start) <= min(end_a, w_end) for w_start, w_end in watch_intervals)
+
+
 def filter_deduplicated_step_samples(samples: Sequence[HealthSample]) -> list[HealthSample]:
     """Filters multi-device Apple Health step samples with Apple Watch overlap priority.
 
@@ -51,22 +59,12 @@ def filter_deduplicated_step_samples(samples: Sequence[HealthSample]) -> list[He
 
     surviving: list[HealthSample] = []
     for s, kind in classified:
-        if kind == "phone":
-            p_start, p_end = _step_sample_interval(s)
-            if any(
-                max(p_start, w_start) <= min(p_end, w_end)
-                for w_start, w_end in watch_intervals
-            ):
-                continue
+        if kind == "phone" and _intervals_overlap(*_step_sample_interval(s), watch_intervals):
+            continue
         surviving.append(s)
     return surviving
 
 
 def deduplicate_step_samples(samples: Sequence[HealthSample]) -> Decimal:
-    """Calculates true total steps across multi-device Apple Health step samples.
-
-    When both Apple Watch and iPhone record steps during the same interval, Apple Watch
-    takes priority. Non-overlapping iPhone intervals (e.g. phone carried while watch is charging)
-    are retained. Third-party/unlabeled pedometer samples are added cleanly.
-    """
+    """Calculates true total steps across multi-device Apple Health step samples."""
     return sum((s.value for s in filter_deduplicated_step_samples(samples)), Decimal(0))

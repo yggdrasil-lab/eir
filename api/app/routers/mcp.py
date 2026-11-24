@@ -7,25 +7,23 @@ the official MCP Python SDK (mcp.server.mcpserver.MCPServer).
 from __future__ import annotations
 
 import contextlib
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
-from typing import Any, Iterator
+from typing import Any
 import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.config import settings
-from app.models import BiometricMeasurement, HealthSample
+from app.daily_biometrics import BiometricsInputError, DailyBiometrics
 from app.schemas import BiometricCreate
 
 SOURCE = "agent"
@@ -57,7 +55,7 @@ def mcp_session() -> Session:
     return SessionLocal()
 
 
-def _serialise_measurement(m: BiometricMeasurement) -> dict[str, Any]:
+def _serialise_measurement(m: Any) -> dict[str, Any]:
     return {
         "id": str(m.id),
         "measured_at": m.measured_at.isoformat(),
@@ -78,49 +76,10 @@ def _serialise_measurement(m: BiometricMeasurement) -> dict[str, Any]:
 
 def _get_latest_biometrics_tool(source: str | None = None) -> str:
     with mcp_session() as db:
-        stmt = select(BiometricMeasurement).where(BiometricMeasurement.deleted_at.is_(None))
-        if source:
-            stmt = stmt.where(BiometricMeasurement.source == source)
-        reading = db.scalar(stmt.order_by(BiometricMeasurement.measured_at.desc()).limit(1))
+        reading = DailyBiometrics(db).latest_measurement(source=source)
         if not reading:
             return json.dumps({"status": "empty", "message": "No biometric records found."})
         return json.dumps(_serialise_measurement(reading))
-
-
-def _accumulate_mcp_daily_summary(
-    target_date: str,
-    records: list[BiometricMeasurement],
-) -> dict[str, Any]:
-    summary: dict[str, Any] = {
-        "date": target_date,
-        "latest_weight_kg": None,
-        "latest_body_fat_pct": None,
-        "resting_hr_bpm": None,
-        "hrv_ms": None,
-        "sleep_duration_hours": None,
-        "sleep_score": None,
-        "step_count": 0,
-        "active_energy_kcal": 0,
-        "readings_count": len(records),
-    }
-    for r in records:
-        if r.weight_kg is not None:
-            summary["latest_weight_kg"] = float(r.weight_kg)
-        if r.body_fat_pct is not None:
-            summary["latest_body_fat_pct"] = float(r.body_fat_pct)
-        if r.resting_hr_bpm is not None:
-            summary["resting_hr_bpm"] = r.resting_hr_bpm
-        if r.hrv_ms is not None:
-            summary["hrv_ms"] = float(r.hrv_ms)
-        if r.sleep_duration_s is not None:
-            summary["sleep_duration_hours"] = round(r.sleep_duration_s / 3600.0, 2)
-        if r.sleep_score is not None:
-            summary["sleep_score"] = r.sleep_score
-        if r.step_count is not None:
-            summary["step_count"] += r.step_count
-        if r.active_energy_kcal is not None:
-            summary["active_energy_kcal"] += r.active_energy_kcal
-    return summary
 
 
 def _get_daily_summary_tool(target_date: str) -> str:
@@ -129,32 +88,12 @@ def _get_daily_summary_tool(target_date: str) -> str:
     except ValueError as err:
         raise ToolError(f"Invalid date format: {target_date}. Expected YYYY-MM-DD.") from err
 
-    start_dt = datetime.combine(d, time.min).replace(tzinfo=settings.tz)
-    end_dt = datetime.combine(d, time.max).replace(tzinfo=settings.tz)
     with mcp_session() as db:
-        records = list(
-            db.scalars(
-                select(BiometricMeasurement)
-                .where(
-                    BiometricMeasurement.deleted_at.is_(None),
-                    BiometricMeasurement.measured_at >= start_dt,
-                    BiometricMeasurement.measured_at <= end_dt,
-                )
-                .order_by(BiometricMeasurement.measured_at.asc())
-            )
-        )
-        summary = _accumulate_mcp_daily_summary(target_date, records)
-        granular_active_energy = db.scalar(
-            select(func.sum(HealthSample.value)).where(
-                HealthSample.deleted_at.is_(None),
-                HealthSample.sample_type == "active_energy",
-                HealthSample.measured_at >= start_dt,
-                HealthSample.measured_at <= end_dt,
-            )
-        )
-        if granular_active_energy is not None:
-            summary["active_energy_kcal"] = int(round(granular_active_energy))
-        return json.dumps(summary)
+        try:
+            summary = DailyBiometrics(db).daily_summary(d)
+        except BiometricsInputError as exc:
+            raise ToolError(str(exc)) from exc
+        return json.dumps(summary.model_dump(mode="json"))
 
 
 def _get_granular_samples_tool(target_date: str, sample_type: str, limit: int = 1000) -> str:
@@ -163,22 +102,11 @@ def _get_granular_samples_tool(target_date: str, sample_type: str, limit: int = 
     except ValueError as err:
         raise ToolError(f"Invalid date format: {target_date}. Expected YYYY-MM-DD.") from err
 
-    start_dt = datetime.combine(d, time.min).replace(tzinfo=settings.tz)
-    end_dt = datetime.combine(d, time.max).replace(tzinfo=settings.tz)
     with mcp_session() as db:
-        samples = list(
-            db.scalars(
-                select(HealthSample)
-                .where(
-                    HealthSample.deleted_at.is_(None),
-                    HealthSample.sample_type == sample_type,
-                    HealthSample.measured_at >= start_dt,
-                    HealthSample.measured_at <= end_dt,
-                )
-                .order_by(HealthSample.measured_at.asc())
-                .limit(limit)
-            )
-        )
+        try:
+            samples = DailyBiometrics(db).granular_samples(d, sample_type, limit=limit)
+        except BiometricsInputError as exc:
+            raise ToolError(str(exc)) from exc
         results = [
             {
                 "measured_at": s.measured_at.isoformat(),
@@ -188,7 +116,9 @@ def _get_granular_samples_tool(target_date: str, sample_type: str, limit: int = 
             }
             for s in samples
         ]
-        return json.dumps({"date": target_date, "sample_type": sample_type, "count": len(results), "samples": results})
+        return json.dumps(
+            {"date": target_date, "sample_type": sample_type, "count": len(results), "samples": results}
+        )
 
 
 def _log_measurement_tool(
@@ -202,10 +132,9 @@ def _log_measurement_tool(
     notes: str | None = None,
 ) -> str:
     sleep_s = int(sleep_duration_hours * 3600) if sleep_duration_hours is not None else None
-    measurement = BiometricMeasurement(
-        id=uuid.uuid4(),
+    payload = BiometricCreate(
         measured_at=datetime.now(timezone.utc),
-        source="agent",
+        source=SOURCE,
         weight_kg=Decimal(str(weight_kg)) if weight_kg is not None else None,
         body_fat_pct=Decimal(str(body_fat_pct)) if body_fat_pct is not None else None,
         resting_hr_bpm=resting_hr_bpm,
@@ -217,7 +146,10 @@ def _log_measurement_tool(
         extra={"source": SOURCE, "logged_by": "mcp"},
     )
     with mcp_session() as db:
-        db.add(measurement)
+        try:
+            measurement = DailyBiometrics(db).record_measurement(payload)
+        except BiometricsInputError as exc:
+            raise ToolError(str(exc)) from exc
         db.commit()
         db.refresh(measurement)
         return json.dumps(_serialise_measurement(measurement))
@@ -293,9 +225,9 @@ def build_mcp_server() -> MCPServer:
 class _RebuildableApp:
     def __init__(self, server: MCPServer) -> None:
         self._server = server
-        self.app: Starlette | None = None
+        self.app: Any = None
 
-    def _build(self) -> Starlette:
+    def _build(self) -> Any:
         return self._server.streamable_http_app(
             streamable_http_path="/mcp",
             stateless_http=True,

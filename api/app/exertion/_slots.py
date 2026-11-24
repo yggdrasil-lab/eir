@@ -4,9 +4,9 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta, tzinfo
 from decimal import Decimal
 
+from app.exertion._steps import filter_deduplicated_step_samples
 from app.exertion._types import BucketedWindow, InvalidWindowError, SampleSlot
 from app.models import HealthSample
-from app.services.biometrics import filter_deduplicated_step_samples
 
 SLOT_SECONDS = 300
 

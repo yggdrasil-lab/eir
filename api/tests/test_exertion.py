@@ -65,7 +65,13 @@ class TestExertionDeepModule(unittest.TestCase):
     def test_public_exports_are_strictly_bounded(self):
         self.assertEqual(
             set(exertion_pkg.__all__),
-            {"ExertionAnalyzer", "ExertionProfile", "InvalidWindowError"},
+            {
+                "ExertionAnalyzer",
+                "ExertionProfile",
+                "InvalidWindowError",
+                "deduplicate_step_samples",
+                "filter_deduplicated_step_samples",
+            },
         )
 
     def test_invalid_window_error_for_equal_inverted_and_mixed_tz_bounds(self):
