@@ -11,11 +11,14 @@ from app.services.biometrics import filter_deduplicated_step_samples
 SLOT_SECONDS = 300
 
 
+def _to_local_dt(dt_val: datetime, tz: tzinfo) -> datetime:
+    """Normalizes a datetime to the target timezone."""
+    return dt_val.astimezone(tz) if dt_val.tzinfo else dt_val.replace(tzinfo=tz)
+
+
 def sample_local_dt(sample: HealthSample, tz: tzinfo) -> datetime:
     """Normalizes a HealthSample measured_at timestamp to the target timezone."""
-    if sample.measured_at.tzinfo:
-        return sample.measured_at.astimezone(tz)
-    return sample.measured_at.replace(tzinfo=tz)
+    return _to_local_dt(sample.measured_at, tz)
 
 
 def normalize_window_bounds(
@@ -53,6 +56,89 @@ def _in_bucket_bounds(
     return dt_val <= end_dt if inclusive_end else dt_val < end_dt
 
 
+def _duration_us(delta: timedelta) -> int:
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _step_sample_in_window(
+    sample: HealthSample,
+    start_dt: datetime,
+    end_dt: datetime,
+    tz: tzinfo,
+    inclusive_end: bool,
+) -> bool:
+    s_start = _to_local_dt(sample.measured_at, tz)
+    if sample.ended_at is None:
+        return _in_bucket_bounds(s_start, start_dt, end_dt, inclusive_end)
+    s_end = _to_local_dt(sample.ended_at, tz)
+    if s_end <= s_start:
+        return _in_bucket_bounds(s_start, start_dt, end_dt, inclusive_end)
+    end_ok = s_start <= end_dt if inclusive_end else s_start < end_dt
+    return end_ok and s_end > start_dt
+
+
+def _prorate_step_interval(
+    sample: HealthSample,
+    step_totals: list[Decimal],
+    start_dt: datetime,
+    window_end: datetime,
+    tz: tzinfo,
+    num_slots: int,
+) -> None:
+    s_start = _to_local_dt(sample.measured_at, tz)
+    s_end = _to_local_dt(sample.ended_at, tz)  # type: ignore[arg-type]
+    clamped_start = max(s_start, start_dt)
+    clamped_end = min(s_end, window_end)
+    if clamped_end <= clamped_start:
+        return
+
+    slot_us = SLOT_SECONDS * 1_000_000
+    total_us = _duration_us(s_end - s_start)
+    overlap_us = _duration_us(clamped_end - clamped_start)
+    first_idx = max(0, _duration_us(clamped_start - start_dt) // slot_us)
+    last_idx = min(num_slots - 1, (_duration_us(clamped_end - start_dt) - 1) // slot_us)
+    if last_idx < first_idx:
+        return
+
+    fully_inside = s_start >= start_dt and s_end <= window_end
+    target_total = sample.value if fully_inside else (sample.value * Decimal(overlap_us) / Decimal(total_us))
+    allocated = Decimal(0)
+    for idx in range(first_idx, last_idx + 1):
+        if idx == last_idx:
+            step_totals[idx] += target_total - allocated
+            return
+        slot_start = start_dt + timedelta(seconds=idx * SLOT_SECONDS)
+        slot_end = min(start_dt + timedelta(seconds=(idx + 1) * SLOT_SECONDS), window_end)
+        slot_ov_us = _duration_us(min(clamped_end, slot_end) - max(clamped_start, slot_start))
+        if slot_ov_us <= 0:
+            continue
+        share = sample.value * Decimal(slot_ov_us) / Decimal(total_us)
+        step_totals[idx] += share
+        allocated += share
+
+
+def _accumulate_step_sample(
+    sample: HealthSample,
+    step_totals: list[Decimal],
+    start_dt: datetime,
+    end_dt: datetime,
+    tz: tzinfo,
+    num_slots: int,
+    inclusive_end: bool,
+) -> None:
+    s_start = _to_local_dt(sample.measured_at, tz)
+    s_end = _to_local_dt(sample.ended_at, tz) if sample.ended_at is not None else None
+    if s_end is not None and s_end > s_start:
+        window_end = min(end_dt, start_dt + timedelta(seconds=num_slots * SLOT_SECONDS))
+        _prorate_step_interval(sample, step_totals, start_dt, window_end, tz, num_slots)
+        return
+    if not _in_bucket_bounds(s_start, start_dt, end_dt, inclusive_end):
+        return
+    idx = int((s_start - start_dt).total_seconds() // SLOT_SECONDS)
+    if 0 <= idx < num_slots:
+        step_totals[idx] += sample.value
+
+
 def _accumulate_slot_samples(
     samples: Sequence[HealthSample],
     deduped_steps: Sequence[HealthSample],
@@ -79,9 +165,7 @@ def _accumulate_slot_samples(
             hr_lists[idx].append(float(s.value))
 
     for s in deduped_steps:
-        idx = int((sample_local_dt(s, tz) - start_dt).total_seconds() // SLOT_SECONDS)
-        if 0 <= idx < num_slots:
-            step_totals[idx] += s.value
+        _accumulate_step_sample(s, step_totals, start_dt, end_dt, tz, num_slots, inclusive_end)
     return energies, hr_lists, step_totals
 
 
@@ -97,7 +181,7 @@ def bucket_samples_into_5min_slots(
     raw_steps = [
         s for s in samples
         if s.sample_type in ("step_count", "steps")
-        and _in_bucket_bounds(sample_local_dt(s, tz), start_dt, end_dt, inclusive_end)
+        and _step_sample_in_window(s, start_dt, end_dt, tz, inclusive_end)
     ]
     deduped_steps = filter_deduplicated_step_samples(raw_steps)
     num_slots = (

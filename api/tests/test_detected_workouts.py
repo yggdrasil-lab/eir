@@ -1003,11 +1003,13 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertEqual(workout["duration_minutes"], 40)
         self.assertEqual(workout["classification"], "gym")
         self.assertEqual(workout["routine_name"], "Resistance Training")
-        self.assertEqual(workout["step_count"], 964)
+        # Proportional interval bucketing attributes ~540 steps of 16:53:46->17:03:27 into 16:55-17:05
+        # while deduplicating all 1,254 overlapping iPhone steps (540 + 964 = 1,504).
+        self.assertEqual(workout["step_count"], 1504)
         self.assertEqual(workout["avg_hr_bpm"], 115)
         self.assertEqual(workout["peak_hr_bpm"], 140)
 
-        # Window metrics endpoint must also deduplicate across slots consistently
+        # Window metrics endpoint must also deduplicate and pro-rate overlapping intervals consistently
         win_res = self.client.get(
             "/biometrics/workout-metrics",
             params={
@@ -1018,7 +1020,7 @@ class TestDetectedWorkouts(unittest.TestCase):
         self.assertEqual(win_res.status_code, 200)
         win_data = win_res.json()
         self.assertEqual(win_data["classification"], "gym")
-        self.assertEqual(win_data["step_count"], 964)
+        self.assertEqual(win_data["step_count"], 1504)
 
     def test_detected_workouts_moderate_hr_resistance_not_badminton(self):
         from zoneinfo import ZoneInfo
