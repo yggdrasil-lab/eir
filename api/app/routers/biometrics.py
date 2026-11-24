@@ -1,16 +1,16 @@
 """Biometrics router for reading and managing health time-series."""
 
-from datetime import date, datetime, time
+from datetime import date, datetime
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.daily_biometrics import BiometricsInputError, DailyBiometrics
 from app.db import get_db
 from app.exertion import ExertionAnalyzer, InvalidWindowError
-from app.models import BiometricMeasurement, HealthFeedback, HealthSample
+from app.models import BiometricMeasurement, HealthSample
 from app.schemas import (
     BiometricCreate,
     BiometricRead,
@@ -19,7 +19,6 @@ from app.schemas import (
     HealthSampleRead,
     WorkoutTimelineRead,
 )
-from app.services.biometrics import deduplicate_step_samples
 
 router = APIRouter(prefix="/biometrics", tags=["biometrics"])
 
@@ -32,21 +31,10 @@ def get_granular_samples(
     db: Session = Depends(get_db),
 ) -> list[HealthSample]:
     """Retrieves high-resolution time-series samples for a specific date and metric."""
-    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
-    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
-
-    stmt = (
-        select(HealthSample)
-        .where(
-            HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type == sample_type,
-            HealthSample.measured_at >= start_dt,
-            HealthSample.measured_at <= end_dt,
-        )
-        .order_by(HealthSample.measured_at.asc())
-        .limit(limit)
-    )
-    return list(db.scalars(stmt))
+    try:
+        return DailyBiometrics(db).granular_samples(target_date, sample_type, limit=limit)
+    except BiometricsInputError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/latest", response_model=BiometricRead | None)
@@ -55,157 +43,7 @@ def get_latest_biometrics(
     db: Session = Depends(get_db),
 ) -> BiometricMeasurement | None:
     """Returns the most recent biometric record."""
-    stmt = select(BiometricMeasurement).where(BiometricMeasurement.deleted_at.is_(None))
-    if source:
-        stmt = stmt.where(BiometricMeasurement.source == source)
-    stmt = stmt.order_by(BiometricMeasurement.measured_at.desc()).limit(1)
-    return db.scalar(stmt)
-
-
-def _apply_measurement_rollups(
-    summary: DailyBiometricSummary,
-    records: list[BiometricMeasurement],
-) -> list[str]:
-    readiness_notes: list[str] = []
-    for r in records:
-        if r.weight_kg is not None:
-            summary.latest_weight_kg = r.weight_kg
-        if r.body_fat_pct is not None:
-            summary.latest_body_fat_pct = r.body_fat_pct
-        if r.resting_hr_bpm is not None:
-            summary.resting_hr_bpm = r.resting_hr_bpm
-        if r.hrv_ms is not None:
-            summary.hrv_ms = r.hrv_ms
-        if r.sleep_duration_s is not None:
-            summary.sleep_duration_hours = round(r.sleep_duration_s / 3600.0, 2)
-        if r.sleep_deep_s is not None:
-            summary.sleep_deep_hours = round(r.sleep_deep_s / 3600.0, 2)
-        if r.sleep_rem_s is not None:
-            summary.sleep_rem_hours = round(r.sleep_rem_s / 3600.0, 2)
-        if r.sleep_score is not None:
-            summary.sleep_score = r.sleep_score
-        if r.step_count is not None:
-            summary.step_count = (summary.step_count or 0) + r.step_count
-        if r.active_energy_kcal is not None:
-            summary.active_energy_kcal = (summary.active_energy_kcal or 0) + r.active_energy_kcal
-        _apply_measurement_extras(summary, r.extra)
-        if r.notes:
-            readiness_notes.append(r.notes)
-    return readiness_notes
-
-
-def _apply_measurement_extras(summary: DailyBiometricSummary, extra: dict | None) -> None:
-    if not extra:
-        return
-    extra_fields = (
-        "wrist_temperature_c",
-        "respiratory_rate_bpm",
-        "oxygen_saturation_pct",
-        "walking_asymmetry_pct",
-        "vo2_max",
-    )
-    for key in extra_fields:
-        if key in extra:
-            setattr(summary, key, extra[key])
-
-
-def _avg_sample_in_window(
-    db: Session,
-    sample_types: list[str],
-    start_dt: datetime,
-    end_dt: datetime,
-    digits: int,
-) -> float | None:
-    val = db.scalar(
-        select(func.avg(HealthSample.value)).where(
-            HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type.in_(sample_types),
-            HealthSample.measured_at >= start_dt,
-            HealthSample.measured_at <= end_dt,
-        )
-    )
-    return round(float(val), digits) if val is not None else None
-
-
-def _fill_granular_summary_fallbacks(
-    db: Session,
-    summary: DailyBiometricSummary,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> None:
-    avg_specs = (
-        ("wrist_temperature_c", ["wrist_temperature", "wrist_temp", "wrist_temperature_c"], 2),
-        ("respiratory_rate_bpm", ["respiratory_rate", "sleeping_respiratory_rate", "respiratory_rate_bpm"], 1),
-        ("oxygen_saturation_pct", ["oxygen_saturation", "spo2", "blood_oxygen"], 1),
-        ("walking_asymmetry_pct", ["walking_asymmetry", "walking_ asymmetry", "walking asymmetry", "walking_asymmetry_percentage"], 2),
-    )
-    for attr, sample_types, digits in avg_specs:
-        if getattr(summary, attr) is None:
-            setattr(summary, attr, _avg_sample_in_window(db, sample_types, start_dt, end_dt, digits))
-
-    if summary.vo2_max is None:
-        vm = db.scalar(
-            select(HealthSample.value)
-            .where(
-                HealthSample.deleted_at.is_(None),
-                HealthSample.sample_type.in_(["vo2_max", "cardio_fitness", "vo2max"]),
-                HealthSample.measured_at <= end_dt,
-            )
-            .order_by(HealthSample.measured_at.desc())
-            .limit(1)
-        )
-        if vm is not None:
-            summary.vo2_max = round(float(vm), 1)
-
-    if summary.sleep_rem_hours is None:
-        sleep_samples = list(
-            db.scalars(
-                select(HealthSample).where(
-                    HealthSample.deleted_at.is_(None),
-                    HealthSample.sample_type.in_(["sleep", "sleep_duration", "sleep_duration_s"]),
-                    HealthSample.measured_at >= start_dt,
-                    HealthSample.measured_at <= end_dt,
-                )
-            )
-        )
-        rem_total = sum(
-            (float(s.value) for s in sleep_samples if str((s.extra or {}).get("stage") or "").lower() == "rem"),
-            0.0,
-        )
-        if rem_total > 0:
-            summary.sleep_rem_hours = round(rem_total / 3600.0, 2)
-
-
-def _fill_daily_energy_and_steps(
-    db: Session,
-    summary: DailyBiometricSummary,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> None:
-    granular_energy = db.scalar(
-        select(func.sum(HealthSample.value)).where(
-            HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type == "active_energy",
-            HealthSample.measured_at >= start_dt,
-            HealthSample.measured_at <= end_dt,
-        )
-    )
-    if granular_energy is not None:
-        summary.active_energy_kcal = int(round(granular_energy))
-
-    if summary.step_count is None:
-        raw_steps = list(
-            db.scalars(
-                select(HealthSample).where(
-                    HealthSample.deleted_at.is_(None),
-                    HealthSample.sample_type.in_(["step_count", "steps"]),
-                    HealthSample.measured_at >= start_dt,
-                    HealthSample.measured_at <= end_dt,
-                )
-            )
-        )
-        if raw_steps:
-            summary.step_count = int(round(deduplicate_step_samples(raw_steps)))
+    return DailyBiometrics(db).latest_measurement(source=source)
 
 
 @router.get("/daily/{target_date}", response_model=DailyBiometricSummary)
@@ -214,39 +52,10 @@ def get_daily_summary(
     db: Session = Depends(get_db),
 ) -> DailyBiometricSummary:
     """Aggregates all biometric readings for a single calendar day."""
-    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
-    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
-    records = list(
-        db.scalars(
-            select(BiometricMeasurement)
-            .where(
-                BiometricMeasurement.deleted_at.is_(None),
-                BiometricMeasurement.measured_at >= start_dt,
-                BiometricMeasurement.measured_at <= end_dt,
-            )
-            .order_by(BiometricMeasurement.measured_at.asc())
-        )
-    )
-    summary = DailyBiometricSummary(date=target_date)
-    readiness_notes = _apply_measurement_rollups(summary, records)
-    _fill_daily_energy_and_steps(db, summary, start_dt, end_dt)
-    _fill_granular_summary_fallbacks(db, summary, start_dt, end_dt)
-
-    feedback_stmt = select(HealthFeedback).where(
-        HealthFeedback.deleted_at.is_(None),
-        HealthFeedback.date == target_date,
-    )
-    for fb in db.scalars(feedback_stmt):
-        if fb.feedback_type in ("fasting", "workout", "wellness"):
-            setattr(summary, fb.feedback_type, fb)
-
-    summary.readiness_notes = readiness_notes
-    summary.detected_workouts = ExertionAnalyzer(db).detect_day(target_date)
-    if summary.detected_workouts:
-        detected_energy_total = sum(w.active_energy_kcal for w in summary.detected_workouts)
-        if summary.active_energy_kcal is None or detected_energy_total > summary.active_energy_kcal:
-            summary.active_energy_kcal = detected_energy_total
-    return summary
+    try:
+        return DailyBiometrics(db).daily_summary(target_date)
+    except BiometricsInputError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/detected-workouts", response_model=list[DetectedWorkoutRead])
@@ -319,27 +128,10 @@ def create_biometric_entry(
     db: Session = Depends(get_db),
 ) -> BiometricMeasurement:
     """Manually records a biometric measurement."""
-    measurement = BiometricMeasurement(
-        id=uuid.uuid4(),
-        measured_at=payload.measured_at,
-        source=payload.source,
-        weight_kg=payload.weight_kg,
-        body_fat_pct=payload.body_fat_pct,
-        muscle_mass_kg=payload.muscle_mass_kg,
-        water_pct=payload.water_pct,
-        bone_mass_kg=payload.bone_mass_kg,
-        resting_hr_bpm=payload.resting_hr_bpm,
-        hrv_ms=payload.hrv_ms,
-        sleep_duration_s=payload.sleep_duration_s,
-        sleep_deep_s=payload.sleep_deep_s,
-        sleep_rem_s=payload.sleep_rem_s,
-        sleep_score=payload.sleep_score,
-        step_count=payload.step_count,
-        active_energy_kcal=payload.active_energy_kcal,
-        notes=payload.notes,
-        extra=payload.extra,
-    )
-    db.add(measurement)
+    try:
+        measurement = DailyBiometrics(db).record_measurement(payload)
+    except BiometricsInputError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     db.commit()
     db.refresh(measurement)
     return measurement

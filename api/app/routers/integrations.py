@@ -4,7 +4,7 @@ Receives webhook payloads from Withings Cloud and iOS Shortcuts (HealthKit),
 persisting biometrics and high-resolution health samples.
 """
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
 from typing import Any
@@ -14,20 +14,18 @@ import uuid
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.daily_biometrics import DailyBiometrics
 from app.db import get_db
 from app.models import BiometricMeasurement, HealthSample, OAuthToken
-from app.exertion import ExertionAnalyzer
-from app.services.biometrics import deduplicate_step_samples
 from app.services.kratos_sync import sync_detected_workouts_to_kratos
 from app.schemas import (
     AppleHealthComprehensiveSyncPayload,
     AppleHealthSyncResponse,
     BiometricRead,
-    DetectedWorkoutRead,
     HealthSampleItem,
     WithingsAuthStatusResponse,
     WithingsMeasurementPayload,
@@ -78,202 +76,6 @@ def _normalize_key_dt(dt_: datetime | None) -> str:
     if dt_.tzinfo is not None:
         return dt_.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     return dt_.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _latest_sample_value(
-    db: Session,
-    sample_types: list[str],
-    start_dt: datetime,
-    end_dt: datetime,
-) -> Decimal | None:
-    return db.scalar(
-        select(HealthSample.value)
-        .where(
-            HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type.in_(sample_types),
-            HealthSample.measured_at >= start_dt,
-            HealthSample.measured_at <= end_dt,
-        )
-        .order_by(HealthSample.measured_at.desc())
-        .limit(1)
-    )
-
-
-def _avg_sample_value(
-    db: Session,
-    sample_types: list[str],
-    start_dt: datetime,
-    end_dt: datetime,
-) -> float | None:
-    return db.scalar(
-        select(func.avg(HealthSample.value)).where(
-            HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type.in_(sample_types),
-            HealthSample.measured_at >= start_dt,
-            HealthSample.measured_at <= end_dt,
-        )
-    )
-
-
-def _compute_sleep_totals(
-    db: Session,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> tuple[bool, int, int, int]:
-    sleep_samples = db.scalars(
-        select(HealthSample).where(
-            HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type.in_(["sleep", "sleep_duration", "sleep_duration_s", "sleep_analysis"]),
-            HealthSample.measured_at >= start_dt,
-            HealthSample.measured_at <= end_dt,
-        )
-    ).all()
-    sleep_total_s = 0
-    sleep_deep_s = 0
-    sleep_rem_s = 0
-    for s in sleep_samples:
-        stage = str((s.extra or {}).get("stage") or "").strip().lower()
-        if stage in ("awake", "inbed", "in_bed", "in bed"):
-            continue
-        val = int(round(s.value))
-        sleep_total_s += val
-        if stage == "deep":
-            sleep_deep_s += val
-        elif stage == "rem":
-            sleep_rem_s += val
-    return bool(sleep_samples), sleep_total_s, sleep_deep_s, sleep_rem_s
-
-
-def _compute_daily_energy_and_steps(
-    db: Session,
-    target_date: date,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> tuple[Decimal | None, Decimal | None]:
-    energy_kcal = db.scalar(
-        select(func.sum(HealthSample.value)).where(
-            HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type.in_(["active_energy", "active_energy_kcal"]),
-            HealthSample.measured_at >= start_dt,
-            HealthSample.measured_at <= end_dt,
-        )
-    )
-    detected_for_day = ExertionAnalyzer(db).detect_day(target_date)
-    detected_energy_total = sum(w.active_energy_kcal for w in detected_for_day)
-    if energy_kcal is not None and detected_energy_total > float(energy_kcal):
-        energy_kcal = Decimal(detected_energy_total)
-    elif energy_kcal is None and detected_energy_total > 0:
-        energy_kcal = Decimal(detected_energy_total)
-
-    step_samples = db.scalars(
-        select(HealthSample).where(
-            HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type.in_(["step_count", "steps"]),
-            HealthSample.measured_at >= start_dt,
-            HealthSample.measured_at <= end_dt,
-        ).order_by(HealthSample.measured_at.asc())
-    ).all()
-    steps = deduplicate_step_samples(step_samples) if step_samples else None
-    return energy_kcal, steps
-
-
-def _find_or_init_daily_measurement(
-    db: Session,
-    target_date: date,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> BiometricMeasurement:
-    measurement = db.scalar(
-        select(BiometricMeasurement).where(
-            BiometricMeasurement.deleted_at.is_(None),
-            BiometricMeasurement.measured_at >= start_dt,
-            BiometricMeasurement.measured_at <= end_dt,
-        ).order_by(BiometricMeasurement.measured_at.desc()).limit(1)
-    )
-    if measurement:
-        return measurement
-    measurement = BiometricMeasurement(
-        id=uuid.uuid4(),
-        measured_at=datetime.combine(target_date, time(8, 0)).replace(tzinfo=settings.tz),
-        source="daily_rollup",
-        notes=f"Daily health rollup for {target_date.isoformat()}",
-    )
-    db.add(measurement)
-    return measurement
-
-
-def _populate_rollup_fields(
-    db: Session,
-    measurement: BiometricMeasurement,
-    target_date: date,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> None:
-    latest_specs = (
-        ("weight_kg", ["weight", "weight_kg"]),
-        ("body_fat_pct", ["body_fat_pct", "body_fat", "body_fat_percentage"]),
-        ("muscle_mass_kg", ["muscle_mass_kg", "muscle_mass", "lean_body_mass"]),
-        ("water_pct", ["water_pct", "water_percentage", "hydration_pct"]),
-        ("bone_mass_kg", ["bone_mass_kg", "bone_mass"]),
-        ("hrv_ms", ["hrv", "heart_rate_variability", "hrv_ms", "hrv_sdnn"]),
-    )
-    for attr, sample_types in latest_specs:
-        val = _latest_sample_value(db, sample_types, start_dt, end_dt)
-        if val is not None:
-            setattr(measurement, attr, val)
-
-    rhr = _latest_sample_value(db, ["resting_hr", "resting_heart_rate", "resting_hr_bpm"], start_dt, end_dt)
-    if rhr is not None:
-        measurement.resting_hr_bpm = int(round(rhr))
-
-    has_sleep, sleep_total_s, sleep_deep_s, sleep_rem_s = _compute_sleep_totals(db, start_dt, end_dt)
-    if has_sleep:
-        measurement.sleep_duration_s = sleep_total_s
-        if sleep_deep_s > 0:
-            measurement.sleep_deep_s = sleep_deep_s
-        if sleep_rem_s > 0:
-            measurement.sleep_rem_s = sleep_rem_s
-
-    energy_kcal, steps = _compute_daily_energy_and_steps(db, target_date, start_dt, end_dt)
-    if energy_kcal is not None:
-        measurement.active_energy_kcal = int(round(energy_kcal))
-    if steps is not None:
-        measurement.step_count = int(round(steps))
-
-
-def _sync_daily_rollups(db: Session, target_date: date) -> BiometricMeasurement:
-    """Calculates and persists daily rollup metrics from health_sample into biometric_measurement."""
-    start_dt = datetime.combine(target_date, time.min).replace(tzinfo=settings.tz)
-    end_dt = datetime.combine(target_date, time.max).replace(tzinfo=settings.tz)
-    measurement = _find_or_init_daily_measurement(db, target_date, start_dt, end_dt)
-    _populate_rollup_fields(db, measurement, target_date, start_dt, end_dt)
-
-    extra_avg_specs = (
-        ("wrist_temperature_c", ["wrist_temperature", "wrist_temp", "wrist_temperature_c"], 2),
-        ("respiratory_rate_bpm", ["respiratory_rate", "sleeping_respiratory_rate", "respiratory_rate_bpm"], 1),
-        ("oxygen_saturation_pct", ["oxygen_saturation", "spo2", "blood_oxygen"], 1),
-        ("walking_asymmetry_pct", ["walking_asymmetry", "walking_ asymmetry", "walking asymmetry", "walking_asymmetry_percentage"], 2),
-    )
-    cur_extra = dict(measurement.extra or {})
-    for key, sample_types, digits in extra_avg_specs:
-        val = _avg_sample_value(db, sample_types, start_dt, end_dt)
-        if val is not None:
-            cur_extra[key] = round(float(val), digits)
-
-    vo2max = db.scalar(
-        select(HealthSample.value)
-        .where(
-            HealthSample.deleted_at.is_(None),
-            HealthSample.sample_type.in_(["vo2_max", "cardio_fitness", "vo2max"]),
-            HealthSample.measured_at <= end_dt,
-        )
-        .order_by(HealthSample.measured_at.desc())
-        .limit(1)
-    )
-    if vo2max is not None:
-        cur_extra["vo2_max"] = round(float(vo2max), 1)
-    measurement.extra = cur_extra
-    return measurement
 
 
 def _log_sync_extra_keys(extra: dict[str, Any]) -> None:
@@ -380,14 +182,10 @@ def sync_apple_health_comprehensive(
     metrics_counts = _upsert_health_samples(db, items, payload.source)
     db.commit()
 
-    days = sorted(set(it.measured_at.date() for it in items))
-    for d in days:
-        _sync_daily_rollups(db, d)
+    batch = DailyBiometrics(db).materialize_rollups([it.measured_at for it in items])
     db.commit()
 
-    detected_workouts: list[DetectedWorkoutRead] = []
-    for d in days:
-        detected_workouts.extend(ExertionAnalyzer(db).detect_day(d))
+    detected_workouts = list(batch.detected_workouts)
     if detected_workouts:
         sync_detected_workouts_to_kratos(detected_workouts, db=db)
 
@@ -395,7 +193,7 @@ def sync_apple_health_comprehensive(
         status="ok",
         total_samples_ingested=len(items),
         metrics_summary=metrics_counts,
-        days_processed=days,
+        days_processed=list(batch.days),
         detected_workouts=detected_workouts,
     )
 
@@ -666,7 +464,7 @@ async def withings_webhook_callback(
                         if meas_data.get("status") == 0:
                             body = meas_data.get("body", {})
                             grps = body.get("measuregrps", [])
-                            days_to_rollup = set()
+                            grp_dates: list[datetime] = []
                             type_map = {
                                 1: ("weight", "kg"),
                                 6: ("body_fat_pct", "%"),
@@ -678,7 +476,7 @@ async def withings_webhook_callback(
                             for grp in grps:
                                 grp_date = datetime.fromtimestamp(grp["date"], tz=timezone.utc)
                                 grpid = grp.get("grpid")
-                                days_to_rollup.add(grp_date.astimezone(settings.tz).date())
+                                grp_dates.append(grp_date)
 
                                 for m in grp.get("measures", []):
                                     m_type = m.get("type")
@@ -720,9 +518,9 @@ async def withings_webhook_callback(
                                         samples_created += 1
 
                             db.commit()
-                            for d in days_to_rollup:
-                                _sync_daily_rollups(db, d)
-                            db.commit()
+                            if grp_dates:
+                                DailyBiometrics(db).materialize_rollups(grp_dates)
+                                db.commit()
             except Exception as exc:
                 logger.error("Failed to query Withings measure API: %s", exc)
 

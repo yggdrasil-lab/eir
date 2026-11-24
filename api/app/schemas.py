@@ -8,6 +8,8 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.daily_biometrics._registry import METRIC_REGISTRY
+
 
 def _clean_numeric(v: Any) -> Decimal | None:
     """Robustly parse numeric values from iOS Shortcuts (handles units, arrays, and multiline)."""
@@ -329,68 +331,9 @@ class HealthSampleRead(ORMModel):
 
 
 # ------------------------------------------------------------- Comprehensive Sync
-DEFAULT_METRIC_UNITS: dict[str, str] = {
-    "active_energy": "kcal",
-    "basal_energy": "kcal",
-    "heart_rate": "bpm",
-    "resting_hr": "bpm",
-    "hrv": "ms",
-    "sleep": "s",
-    "sleep_duration": "s",
-    "step_count": "count",
-    "weight": "kg",
-    "body_fat": "%",
-    "body_fat_pct": "%",
-    "muscle_mass_kg": "kg",
-    "bone_mass_kg": "kg",
-    "water_pct": "%",
-    "distance": "m",
-    "flights": "count",
-    "vo2_max": "ml/kg/min",
-    "oxygen_saturation": "%",
-    "body_temperature": "C",
-    "wrist_temperature": "C",
-    "respiratory_rate": "breaths/min",
-    "walking_asymmetry": "%",
-}
+DEFAULT_METRIC_UNITS: dict[str, str] = METRIC_REGISTRY.default_units()
 
-METRIC_ALIASES: dict[str, str] = {
-    "weight_kg": "weight",
-    "body_fat_percentage": "body_fat_pct",
-    "body_fat": "body_fat_pct",
-    "muscle_mass": "muscle_mass_kg",
-    "lean_body_mass": "muscle_mass_kg",
-    "bone_mass": "bone_mass_kg",
-    "water_percentage": "water_pct",
-    "hydration_pct": "water_pct",
-    "resting_heart_rate": "resting_hr",
-    "resting_hr_bpm": "resting_hr",
-    "heart_rate_variability": "hrv",
-    "hrv_sdnn": "hrv",
-    "hrv_ms": "hrv",
-    "sleep_analysis": "sleep",
-    "sleep_duration_s": "sleep",
-    "sleep_duration": "sleep",
-    "steps": "step_count",
-    "step": "step_count",
-    "active_energy_kcal": "active_energy",
-    "energy": "active_energy",
-    "distance_meters": "distance",
-    "walking_asymmetry": "walking_asymmetry",
-    "walking_ asymmetry": "walking_asymmetry",
-    "walking asymmetry": "walking_asymmetry",
-    "walking_asymmetry_percentage": "walking_asymmetry",
-    "asymmetry": "walking_asymmetry",
-    "sleeping_respiratory_rate": "respiratory_rate",
-    "respiratory_rate_bpm": "respiratory_rate",
-    "respiration_rate": "respiratory_rate",
-    "wrist_temp": "wrist_temperature",
-    "wrist_temperature_c": "wrist_temperature",
-    "spo2": "oxygen_saturation",
-    "blood_oxygen": "oxygen_saturation",
-    "cardio_fitness": "vo2_max",
-    "vo2max": "vo2_max",
-}
+METRIC_ALIASES: dict[str, str] = METRIC_REGISTRY.input_aliases()
 
 
 def _to_list(val: Any) -> list[Any]:
