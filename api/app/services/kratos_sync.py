@@ -10,7 +10,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.routers.biometrics import compute_workout_metrics_for_window
+from app.exertion import ExertionAnalyzer
 from app.schemas import DetectedWorkoutRead
 
 logger = logging.getLogger(__name__)
@@ -380,7 +380,7 @@ def _reconcile_single_confirmed(
             existing_sessions, "skipped_confirmed", primary_extra.get("routine_name") or w.routine_name,
         )
     metrics = (
-        compute_workout_metrics_for_window(db, best_confirmed.started_at, best_confirmed.ended_at)
+        ExertionAnalyzer(db).analyze_window(best_confirmed.started_at, best_confirmed.ended_at)
         if (is_narrower and db is not None)
         else w
     )

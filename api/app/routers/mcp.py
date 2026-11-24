@@ -76,47 +76,64 @@ def _serialise_measurement(m: BiometricMeasurement) -> dict[str, Any]:
     }
 
 
-def build_mcp_server() -> MCPServer:
-    server = MCPServer(
-        name="eir",
-        version="0.1.0",
-        instructions=(
-            "Eir is the homelab biometrics and health telemetry service. Use it to "
-            "retrieve morning weigh-ins, body composition, sleep metrics, and recovery "
-            "vitals (HRV and resting heart rate), or log health measurements."
-        ),
-    )
+def _get_latest_biometrics_tool(source: str | None = None) -> str:
+    with mcp_session() as db:
+        stmt = select(BiometricMeasurement).where(BiometricMeasurement.deleted_at.is_(None))
+        if source:
+            stmt = stmt.where(BiometricMeasurement.source == source)
+        reading = db.scalar(stmt.order_by(BiometricMeasurement.measured_at.desc()).limit(1))
+        if not reading:
+            return json.dumps({"status": "empty", "message": "No biometric records found."})
+        return json.dumps(_serialise_measurement(reading))
 
-    @server.tool(
-        name="eir_get_latest_biometrics",
-        description="Fetch the most recent biometric reading (weight, body fat %, HRV, resting HR, sleep).",
-    )
-    def get_latest_biometrics(source: str | None = None) -> str:
-        with mcp_session() as db:
-            stmt = select(BiometricMeasurement).where(BiometricMeasurement.deleted_at.is_(None))
-            if source:
-                stmt = stmt.where(BiometricMeasurement.source == source)
-            stmt = stmt.order_by(BiometricMeasurement.measured_at.desc()).limit(1)
-            reading = db.scalar(stmt)
-            if not reading:
-                return json.dumps({"status": "empty", "message": "No biometric records found."})
-            return json.dumps(_serialise_measurement(reading))
 
-    @server.tool(
-        name="eir_get_daily_summary",
-        description="Get aggregated health and vitals summary for a specific calendar date (YYYY-MM-DD).",
-    )
-    def get_daily_summary(target_date: str) -> str:
-        try:
-            d = date.fromisoformat(target_date)
-        except ValueError as err:
-            raise ToolError(f"Invalid date format: {target_date}. Expected YYYY-MM-DD.") from err
+def _accumulate_mcp_daily_summary(
+    target_date: str,
+    records: list[BiometricMeasurement],
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "date": target_date,
+        "latest_weight_kg": None,
+        "latest_body_fat_pct": None,
+        "resting_hr_bpm": None,
+        "hrv_ms": None,
+        "sleep_duration_hours": None,
+        "sleep_score": None,
+        "step_count": 0,
+        "active_energy_kcal": 0,
+        "readings_count": len(records),
+    }
+    for r in records:
+        if r.weight_kg is not None:
+            summary["latest_weight_kg"] = float(r.weight_kg)
+        if r.body_fat_pct is not None:
+            summary["latest_body_fat_pct"] = float(r.body_fat_pct)
+        if r.resting_hr_bpm is not None:
+            summary["resting_hr_bpm"] = r.resting_hr_bpm
+        if r.hrv_ms is not None:
+            summary["hrv_ms"] = float(r.hrv_ms)
+        if r.sleep_duration_s is not None:
+            summary["sleep_duration_hours"] = round(r.sleep_duration_s / 3600.0, 2)
+        if r.sleep_score is not None:
+            summary["sleep_score"] = r.sleep_score
+        if r.step_count is not None:
+            summary["step_count"] += r.step_count
+        if r.active_energy_kcal is not None:
+            summary["active_energy_kcal"] += r.active_energy_kcal
+    return summary
 
-        start_dt = datetime.combine(d, time.min).replace(tzinfo=settings.tz)
-        end_dt = datetime.combine(d, time.max).replace(tzinfo=settings.tz)
 
-        with mcp_session() as db:
-            stmt = (
+def _get_daily_summary_tool(target_date: str) -> str:
+    try:
+        d = date.fromisoformat(target_date)
+    except ValueError as err:
+        raise ToolError(f"Invalid date format: {target_date}. Expected YYYY-MM-DD.") from err
+
+    start_dt = datetime.combine(d, time.min).replace(tzinfo=settings.tz)
+    end_dt = datetime.combine(d, time.max).replace(tzinfo=settings.tz)
+    with mcp_session() as db:
+        records = list(
+            db.scalars(
                 select(BiometricMeasurement)
                 .where(
                     BiometricMeasurement.deleted_at.is_(None),
@@ -125,71 +142,32 @@ def build_mcp_server() -> MCPServer:
                 )
                 .order_by(BiometricMeasurement.measured_at.asc())
             )
-            records = list(db.scalars(stmt))
-
-            summary = {
-                "date": target_date,
-                "latest_weight_kg": None,
-                "latest_body_fat_pct": None,
-                "resting_hr_bpm": None,
-                "hrv_ms": None,
-                "sleep_duration_hours": None,
-                "sleep_score": None,
-                "step_count": 0,
-                "active_energy_kcal": 0,
-                "readings_count": len(records),
-            }
-
-            for r in records:
-                if r.weight_kg is not None:
-                    summary["latest_weight_kg"] = float(r.weight_kg)
-                if r.body_fat_pct is not None:
-                    summary["latest_body_fat_pct"] = float(r.body_fat_pct)
-                if r.resting_hr_bpm is not None:
-                    summary["resting_hr_bpm"] = r.resting_hr_bpm
-                if r.hrv_ms is not None:
-                    summary["hrv_ms"] = float(r.hrv_ms)
-                if r.sleep_duration_s is not None:
-                    summary["sleep_duration_hours"] = round(r.sleep_duration_s / 3600.0, 2)
-                if r.sleep_score is not None:
-                    summary["sleep_score"] = r.sleep_score
-                if r.step_count is not None:
-                    summary["step_count"] += r.step_count
-                if r.active_energy_kcal is not None:
-                    summary["active_energy_kcal"] += r.active_energy_kcal
-
-            # Check granular health samples
-            granular_active_energy = db.scalar(
-                select(func.sum(HealthSample.value)).where(
-                    HealthSample.deleted_at.is_(None),
-                    HealthSample.sample_type == "active_energy",
-                    HealthSample.measured_at >= start_dt,
-                    HealthSample.measured_at <= end_dt,
-                )
+        )
+        summary = _accumulate_mcp_daily_summary(target_date, records)
+        granular_active_energy = db.scalar(
+            select(func.sum(HealthSample.value)).where(
+                HealthSample.deleted_at.is_(None),
+                HealthSample.sample_type == "active_energy",
+                HealthSample.measured_at >= start_dt,
+                HealthSample.measured_at <= end_dt,
             )
-            if granular_active_energy is not None:
-                summary["active_energy_kcal"] = int(round(granular_active_energy))
+        )
+        if granular_active_energy is not None:
+            summary["active_energy_kcal"] = int(round(granular_active_energy))
+        return json.dumps(summary)
 
-            # Step count comes from the deduplicated BiometricMeasurement rollup only;
-            # naively summing granular samples would double-count Watch/iPhone overlap.
 
-            return json.dumps(summary)
+def _get_granular_samples_tool(target_date: str, sample_type: str, limit: int = 1000) -> str:
+    try:
+        d = date.fromisoformat(target_date)
+    except ValueError as err:
+        raise ToolError(f"Invalid date format: {target_date}. Expected YYYY-MM-DD.") from err
 
-    @server.tool(
-        name="eir_get_granular_samples",
-        description="Fetch high-resolution time-series samples (e.g. heart rate readings, sleep intervals) for a specific date (YYYY-MM-DD) and sample type.",
-    )
-    def get_granular_samples(target_date: str, sample_type: str, limit: int = 1000) -> str:
-        try:
-            d = date.fromisoformat(target_date)
-        except ValueError as err:
-            raise ToolError(f"Invalid date format: {target_date}. Expected YYYY-MM-DD.") from err
-
-        start_dt = datetime.combine(d, time.min).replace(tzinfo=settings.tz)
-        end_dt = datetime.combine(d, time.max).replace(tzinfo=settings.tz)
-
-        with mcp_session() as db:
-            stmt = (
+    start_dt = datetime.combine(d, time.min).replace(tzinfo=settings.tz)
+    end_dt = datetime.combine(d, time.max).replace(tzinfo=settings.tz)
+    with mcp_session() as db:
+        samples = list(
+            db.scalars(
                 select(HealthSample)
                 .where(
                     HealthSample.deleted_at.is_(None),
@@ -200,62 +178,107 @@ def build_mcp_server() -> MCPServer:
                 .order_by(HealthSample.measured_at.asc())
                 .limit(limit)
             )
-            samples = list(db.scalars(stmt))
-            results = [
-                {
-                    "measured_at": s.measured_at.isoformat(),
-                    "ended_at": s.ended_at.isoformat(),
-                    "value": float(s.value),
-                    "unit": s.unit,
-                }
-                for s in samples
-            ]
-            return json.dumps({
-                "date": target_date,
-                "sample_type": sample_type,
-                "count": len(results),
-                "samples": results,
-            })
+        )
+        results = [
+            {
+                "measured_at": s.measured_at.isoformat(),
+                "ended_at": s.ended_at.isoformat(),
+                "value": float(s.value),
+                "unit": s.unit,
+            }
+            for s in samples
+        ]
+        return json.dumps({"date": target_date, "sample_type": sample_type, "count": len(results), "samples": results})
 
-    @server.tool(
+
+def _log_measurement_tool(
+    weight_kg: float | None = None,
+    body_fat_pct: float | None = None,
+    resting_hr_bpm: int | None = None,
+    hrv_ms: float | None = None,
+    sleep_duration_hours: float | None = None,
+    sleep_score: int | None = None,
+    step_count: int | None = None,
+    notes: str | None = None,
+) -> str:
+    sleep_s = int(sleep_duration_hours * 3600) if sleep_duration_hours is not None else None
+    measurement = BiometricMeasurement(
+        id=uuid.uuid4(),
+        measured_at=datetime.now(timezone.utc),
+        source="agent",
+        weight_kg=Decimal(str(weight_kg)) if weight_kg is not None else None,
+        body_fat_pct=Decimal(str(body_fat_pct)) if body_fat_pct is not None else None,
+        resting_hr_bpm=resting_hr_bpm,
+        hrv_ms=Decimal(str(hrv_ms)) if hrv_ms is not None else None,
+        sleep_duration_s=sleep_s,
+        sleep_score=sleep_score,
+        step_count=step_count,
+        notes=notes,
+        extra={"source": SOURCE, "logged_by": "mcp"},
+    )
+    with mcp_session() as db:
+        db.add(measurement)
+        db.commit()
+        db.refresh(measurement)
+        return json.dumps(_serialise_measurement(measurement))
+
+
+def _get_workout_metrics_tool(
+    started_at: str,
+    ended_at: str,
+    classification: str | None = None,
+    activity_type: str | None = None,
+    routine_name: str | None = None,
+) -> str:
+    from app.exertion import ExertionAnalyzer, InvalidWindowError
+
+    try:
+        s_dt = datetime.fromisoformat(started_at)
+        e_dt = datetime.fromisoformat(ended_at)
+    except ValueError as exc:
+        raise ToolError(f"Invalid ISO-8601 timestamp: {exc}") from exc
+
+    with mcp_session() as db:
+        try:
+            result = ExertionAnalyzer(db).analyze_window(
+                s_dt,
+                e_dt,
+                classification=classification,
+                activity_type=activity_type,
+                routine_name=routine_name,
+            )
+        except InvalidWindowError as exc:
+            raise ToolError(str(exc)) from exc
+        return result.model_dump_json()
+
+
+def build_mcp_server() -> MCPServer:
+    server = MCPServer(
+        name="eir",
+        version="0.1.0",
+        instructions=(
+            "Eir is the homelab biometrics and health telemetry service. Use it to "
+            "retrieve morning weigh-ins, body composition, sleep metrics, and recovery "
+            "vitals (HRV and resting heart rate), or log health measurements."
+        ),
+    )
+    server.tool(
+        name="eir_get_latest_biometrics",
+        description="Fetch the most recent biometric reading (weight, body fat %, HRV, resting HR, sleep).",
+    )(_get_latest_biometrics_tool)
+    server.tool(
+        name="eir_get_daily_summary",
+        description="Get aggregated health and vitals summary for a specific calendar date (YYYY-MM-DD).",
+    )(_get_daily_summary_tool)
+    server.tool(
+        name="eir_get_granular_samples",
+        description="Fetch high-resolution time-series samples (e.g. heart rate readings, sleep intervals) for a specific date (YYYY-MM-DD) and sample type.",
+    )(_get_granular_samples_tool)
+    server.tool(
         name="eir_log_measurement",
         description="Log a biometric measurement (weight, body fat %, resting HR, HRV, sleep, steps) from an agent.",
-    )
-    def log_measurement(
-        weight_kg: float | None = None,
-        body_fat_pct: float | None = None,
-        resting_hr_bpm: int | None = None,
-        hrv_ms: float | None = None,
-        sleep_duration_hours: float | None = None,
-        sleep_score: int | None = None,
-        step_count: int | None = None,
-        notes: str | None = None,
-    ) -> str:
-        sleep_s = int(sleep_duration_hours * 3600) if sleep_duration_hours is not None else None
-        now = datetime.now(timezone.utc)
-
-        measurement = BiometricMeasurement(
-            id=uuid.uuid4(),
-            measured_at=now,
-            source="agent",
-            weight_kg=Decimal(str(weight_kg)) if weight_kg is not None else None,
-            body_fat_pct=Decimal(str(body_fat_pct)) if body_fat_pct is not None else None,
-            resting_hr_bpm=resting_hr_bpm,
-            hrv_ms=Decimal(str(hrv_ms)) if hrv_ms is not None else None,
-            sleep_duration_s=sleep_s,
-            sleep_score=sleep_score,
-            step_count=step_count,
-            notes=notes,
-            extra={"source": SOURCE, "logged_by": "mcp"},
-        )
-
-        with mcp_session() as db:
-            db.add(measurement)
-            db.commit()
-            db.refresh(measurement)
-            return json.dumps(_serialise_measurement(measurement))
-
-    @server.tool(
+    )(_log_measurement_tool)
+    server.tool(
         name="eir_get_workout_metrics",
         description=(
             "Compute full workout exertion metrics (HR zones, TRIMP, RPE, effort_rating, "
@@ -263,36 +286,7 @@ def build_mcp_server() -> MCPServer:
             "ISO-8601 [started_at, ended_at] window. Use when manually splitting or creating "
             "Kratos sessions."
         ),
-    )
-    def get_workout_metrics(
-        started_at: str,
-        ended_at: str,
-        classification: str | None = None,
-        activity_type: str | None = None,
-        routine_name: str | None = None,
-    ) -> str:
-        from app.routers.biometrics import compute_workout_metrics_for_window
-
-        try:
-            s_dt = datetime.fromisoformat(started_at)
-            e_dt = datetime.fromisoformat(ended_at)
-        except ValueError as exc:
-            raise ToolError(f"Invalid ISO-8601 timestamp: {exc}") from exc
-
-        if e_dt <= s_dt:
-            raise ToolError("ended_at must be after started_at")
-
-        with mcp_session() as db:
-            result = compute_workout_metrics_for_window(
-                db,
-                started_at=s_dt,
-                ended_at=e_dt,
-                classification=classification,
-                activity_type=activity_type,
-                routine_name=routine_name,
-            )
-            return result.model_dump_json()
-
+    )(_get_workout_metrics_tool)
     return server
 
 
