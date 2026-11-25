@@ -69,24 +69,25 @@ services:
           memory: 128M
       labels:
         - "traefik.enable=true"
-        # Authentik SSO for web/browser API requests under /api/*
-        - "traefik.http.routers.eir-api.rule=Host(`eir.${DOMAIN_NAME}`) && PathPrefix(`/api`)"
-        - "traefik.http.routers.eir-api.entrypoints=websecure"
-        - "traefik.http.routers.eir-api.tls=true"
-        - "traefik.http.routers.eir-api.tls.certresolver=cloudflare"
-        - "traefik.http.routers.eir-api.middlewares=authentik@docker,eir-api-strip"
-        - "traefik.http.middlewares.eir-api-strip.stripprefix.prefixes=/api"
+        # Strip spoofable Authentik identity headers on non-Authentik public routes
+        - "traefik.http.middlewares.eir-strip-authentik.headers.customrequestheaders.X-authentik-username="
+        - "traefik.http.middlewares.eir-strip-authentik.headers.customrequestheaders.X-authentik-email="
+        - "traefik.http.middlewares.eir-strip-authentik.headers.customrequestheaders.X-authentik-groups="
+        - "traefik.http.middlewares.eir-strip-authentik.headers.customrequestheaders.X-authentik-name="
+        - "traefik.http.middlewares.eir-strip-authentik.headers.customrequestheaders.X-authentik-uid="
         # Machine-to-machine integrations endpoint (Withings webhooks, Apple Health shortcuts)
         - "traefik.http.routers.eir-integrations.rule=Host(`eir.${DOMAIN_NAME}`) && PathPrefix(`/integrations`)"
         - "traefik.http.routers.eir-integrations.entrypoints=websecure"
         - "traefik.http.routers.eir-integrations.tls=true"
         - "traefik.http.routers.eir-integrations.tls.certresolver=cloudflare"
+        - "traefik.http.routers.eir-integrations.middlewares=eir-strip-authentik"
         - "traefik.http.routers.eir-integrations.service=eir-api"
         # Machine-to-machine MCP endpoint for Hermes Agent and Antigravity
         - "traefik.http.routers.eir-mcp.rule=Host(`eir.${DOMAIN_NAME}`) && PathPrefix(`/mcp`)"
         - "traefik.http.routers.eir-mcp.entrypoints=websecure"
         - "traefik.http.routers.eir-mcp.tls=true"
         - "traefik.http.routers.eir-mcp.tls.certresolver=cloudflare"
+        - "traefik.http.routers.eir-mcp.middlewares=eir-strip-authentik"
         - "traefik.http.routers.eir-mcp.service=eir-api"
         - "traefik.http.services.eir-api.loadbalancer.server.port=8000"
         - "traefik.docker.network=aether-net"
