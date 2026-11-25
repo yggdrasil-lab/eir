@@ -1,45 +1,22 @@
 """Seam tests for the app.exertion deep module, callers, and architectural boundaries."""
 
 import ast
-import asyncio
-from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-import json
 from pathlib import Path
 import unittest
-from unittest.mock import patch
 import uuid
 from zoneinfo import ZoneInfo
 
-from mcp.server.mcpserver.exceptions import ToolError
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
 import app.exertion as exertion_pkg
-from app.db import Base
 from app.exertion import ExertionAnalyzer, ExertionProfile, InvalidWindowError
 from app.exertion._slots import bucket_samples_into_5min_slots, is_exertion_slot, sample_local_dt
 from app.exertion._types import SampleSlot
 from app.models import HealthSample
-from app.routers.mcp import build_mcp_server
+from tests._harness import EirTestCase, call_mcp_tool
 
 
-class TestExertionDeepModule(unittest.TestCase):
-    def setUp(self):
-        self.engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        Base.metadata.create_all(bind=self.engine)
-        self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
-        self.db = self.SessionLocal()
-
-    def tearDown(self):
-        self.db.close()
-        Base.metadata.drop_all(bind=self.engine)
+class TestExertionDeepModule(EirTestCase):
 
     def _add_sample(
         self,
@@ -197,40 +174,31 @@ class TestExertionDeepModule(unittest.TestCase):
             self._add_sample(sample_type="heart_rate", measured_at=t, value=Decimal("135"), unit="bpm")
         self.db.commit()
 
-        @contextmanager
-        def fake_mcp_session():
-            session = self.SessionLocal()
-            try:
-                yield session
-            finally:
-                session.close()
-
-        server = build_mcp_server()
-        with patch("app.routers.mcp.mcp_session", fake_mcp_session):
-            # Mixed naive + aware where aware end <= naive start (in Pacific/Auckland)
-            with self.assertRaises(ToolError):
-                asyncio.run(
-                    server.call_tool(
-                        "eir_get_workout_metrics",
-                        {
-                            "started_at": "2026-11-23T19:00:00",
-                            "ended_at": "2026-11-23T18:30:00+13:00",
-                        },
-                    )
-                )
-
-            result = asyncio.run(
-                server.call_tool(
-                    "eir_get_workout_metrics",
-                    {
-                        "started_at": start.isoformat(),
-                        "ended_at": end.isoformat(),
-                        "classification": "gym",
-                    },
-                )
+        token = "exertion-mcp-token"
+        self.patch_settings(mcp_token=token)
+        with self.open_lifespan_client() as client:
+            is_err, _ = call_mcp_tool(
+                client,
+                "eir_get_workout_metrics",
+                {
+                    "started_at": "2026-11-23T19:00:00",
+                    "ended_at": "2026-11-23T18:30:00+13:00",
+                },
+                token=token,
             )
-        content_blocks = result[0] if isinstance(result, tuple) else result.content
-        payload = json.loads(content_blocks[0].text)
+            self.assertTrue(is_err)
+
+            is_err, payload = call_mcp_tool(
+                client,
+                "eir_get_workout_metrics",
+                {
+                    "started_at": start.isoformat(),
+                    "ended_at": end.isoformat(),
+                    "classification": "gym",
+                },
+                token=token,
+            )
+            self.assertFalse(is_err)
         self.assertEqual(payload["duration_minutes"], 30)
         self.assertEqual(payload["classification"], "gym")
         self.assertEqual(payload["active_energy_kcal"], 180)

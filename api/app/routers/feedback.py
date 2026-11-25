@@ -6,7 +6,6 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.db import get_db

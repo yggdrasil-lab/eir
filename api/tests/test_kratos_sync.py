@@ -13,13 +13,8 @@ from unittest.mock import patch
 import uuid
 from zoneinfo import ZoneInfo
 
-from fastapi.testclient import TestClient
 import httpx
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
-from app.db import Base, get_db
 from app.kratos_sync import (
     HttpKratosSessionStore,
     InMemoryKratosSessionStore,
@@ -31,9 +26,9 @@ from app.kratos_sync import (
     SyncOutcome,
     generate_session_id,
 )
-from app.main import app
 from app.models import HealthSample
 from app.schemas import DetectedWorkoutRead
+from tests._harness import EirTestCase
 
 
 class _StubWindowMetrics:
@@ -87,32 +82,7 @@ def _make_workout(
     )
 
 
-class TestKratosReconciler(unittest.TestCase):
-    def setUp(self) -> None:
-        self.engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        Base.metadata.create_all(bind=self.engine)
-        self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
-        self.db = self.SessionLocal()
-
-        def override_get_db():
-            session = self.SessionLocal()
-            try:
-                yield session
-            finally:
-                session.close()
-
-        app.dependency_overrides[get_db] = override_get_db
-        self.client = TestClient(app)
-
-    def tearDown(self) -> None:
-        self.db.close()
-        Base.metadata.drop_all(bind=self.engine)
-        app.dependency_overrides.clear()
-
+class TestKratosReconciler(EirTestCase):
     def test_generate_session_id_deterministic(self) -> None:
         s_iso = "2026-11-11T09:00:00+13:00"
         e_iso = "2026-11-11T10:00:00+13:00"
@@ -748,8 +718,9 @@ class TestHttpKratosSessionStore(unittest.TestCase):
         self.assertTrue(client.is_closed)
 
         with HttpKratosSessionStore("http://kratos-api:8000") as owned_store:
-            self.assertFalse(owned_store._client.is_closed)
-        self.assertTrue(owned_store._client.is_closed)
+            self.assertIsInstance(owned_store, HttpKratosSessionStore)
+        with self.assertRaises(RuntimeError):
+            owned_store.list_sessions()
 
 
 class TestKratosSyncArchitectureBoundaries(unittest.TestCase):

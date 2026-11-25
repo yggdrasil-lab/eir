@@ -1,0 +1,25 @@
+name: Test Eir
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build test container
+        run: docker build -t eir-api:ci-test ./api
+
+      - name: Run container unit tests
+        run: |
+          docker run --rm --entrypoint python -w /work \
+            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/work \
+            -v "$PWD/api:/work:ro" eir-api:ci-test -m tests -v

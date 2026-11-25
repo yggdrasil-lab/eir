@@ -10,14 +10,9 @@ import unittest
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import select
 
-from app.config import settings
 from app.daily_biometrics import DailyBiometrics
-from app.db import Base, get_db
 from app.ingestion import (
     SCALE_DEDUP_METRICS,
     HttpWithingsCloudAdapter,
@@ -42,9 +37,9 @@ from app.ingestion import (
     resolve_measure_window,
     upsert_health_samples,
 )
-from app.main import app
 from app.models import BiometricMeasurement, HealthSample, OAuthToken
 from app.schemas import DetectedWorkoutRead, WithingsMeasurementPayload
+from tests._harness import EirTestCase
 
 
 class _FakeWorkoutSync:
@@ -135,22 +130,10 @@ class TestShortcutsParsingAndNormalization(unittest.TestCase):
         self.assertIn("sample_type", unexpected)
 
 
-class TestScaleDedupAndTelemetryIngestor(unittest.TestCase):
+class TestScaleDedupAndTelemetryIngestor(EirTestCase):
     def setUp(self) -> None:
+        super().setUp()
         self.nz_tz = ZoneInfo("Pacific/Auckland")
-        self.engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        Base.metadata.create_all(bind=self.engine)
-        self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
-        self.db = self.SessionLocal()
-
-    def tearDown(self) -> None:
-        self.db.close()
-        Base.metadata.drop_all(bind=self.engine)
-        self.engine.dispose()
 
     def test_scale_dedup_withings_wins_both_orders_and_all_five_metrics(self) -> None:
         t_withings = datetime(2026, 11, 25, 7, 30, 15, tzinfo=timezone.utc)
@@ -319,27 +302,15 @@ class TestScaleDedupAndTelemetryIngestor(unittest.TestCase):
         self.assertEqual(len(all_measurements), 1)
 
 
-class TestWithingsSyncAndHttpAdapter(unittest.TestCase):
+class TestWithingsSyncAndHttpAdapter(EirTestCase):
     def setUp(self) -> None:
-        self.engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        Base.metadata.create_all(bind=self.engine)
-        self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
-        self.db = self.SessionLocal()
+        super().setUp()
         self.config = WithingsConfig(
             client_id="cid-1",
             client_secret="csec-1",
             redirect_uri="https://eir.example.test/integrations/withings/callback",
         )
         self.fixed_now = datetime(2026, 11, 25, 10, 0, 0, tzinfo=timezone.utc)
-
-    def tearDown(self) -> None:
-        self.db.close()
-        Base.metadata.drop_all(bind=self.engine)
-        self.engine.dispose()
 
     def test_config_requires_explicit_values_without_hardcoded_fallback(self) -> None:
         cfg_missing_redirect = WithingsConfig(client_id="cid-1", client_secret="sec", redirect_uri="  ")
@@ -504,48 +475,30 @@ class TestWithingsSyncAndHttpAdapter(unittest.TestCase):
                 adapter.exchange_code(self.config, "bad-gateway")
 
     def test_router_callback_maps_config_protocol_and_upstream_http_codes(self) -> None:
-        def override_get_db():
-            yield self.db
+        self.patch_settings(
+            withings_client_id=None,
+            withings_client_secret=None,
+            withings_redirect_uri=None,
+        )
+        r500 = self.client.get("/integrations/withings/callback?code=abc")
+        self.assertEqual(r500.status_code, 500)
 
-        app.dependency_overrides[get_db] = override_get_db
-        orig_id = settings.withings_client_id
-        orig_secret = settings.withings_client_secret
-        orig_redirect = settings.withings_redirect_uri
-        try:
-            with TestClient(app) as client:
-                settings.withings_client_id = None
-                settings.withings_client_secret = None
-                settings.withings_redirect_uri = None
-                r500 = client.get("/integrations/withings/callback?code=abc")
-                self.assertEqual(r500.status_code, 500)
+        self.patch_settings(
+            withings_client_id="cid",
+            withings_client_secret="csec",
+            withings_redirect_uri="https://eir.example.test/integrations/withings/callback",
+        )
+        self.override_withings_sync(
+            InMemoryWithingsCloudAdapter(exchange_error=WithingsProtocolError("Withings error 503: bad code"))
+        )
+        r400 = self.client.get("/integrations/withings/callback?code=proto")
+        self.assertEqual(r400.status_code, 400)
 
-                settings.withings_client_id = "cid"
-                settings.withings_client_secret = "csec"
-                settings.withings_redirect_uri = "https://eir.example.test/integrations/withings/callback"
-
-                def map_errors(request: httpx.Request) -> httpx.Response:
-                    if b"code=proto" in request.content:
-                        return httpx.Response(200, json={"status": 503, "error": "bad code"})
-                    return httpx.Response(502, text="bad gateway")
-
-                orig_post = HttpWithingsCloudAdapter._post
-                mock_client = httpx.Client(transport=httpx.MockTransport(map_errors))
-                HttpWithingsCloudAdapter._post = (  # type: ignore[method-assign]
-                    lambda self_adapter, op, url, **kw: mock_client.post(url, **kw)
-                )
-                try:
-                    r400 = client.get("/integrations/withings/callback?code=proto")
-                    self.assertEqual(r400.status_code, 400)
-                    r502 = client.get("/integrations/withings/callback?code=up")
-                    self.assertEqual(r502.status_code, 502)
-                finally:
-                    HttpWithingsCloudAdapter._post = orig_post  # type: ignore[method-assign]
-                    mock_client.close()
-        finally:
-            settings.withings_client_id = orig_id
-            settings.withings_client_secret = orig_secret
-            settings.withings_redirect_uri = orig_redirect
-            app.dependency_overrides.pop(get_db, None)
+        self.override_withings_sync(
+            InMemoryWithingsCloudAdapter(exchange_error=WithingsUpstreamError("Withings token exchange failed with HTTP 502"))
+        )
+        r502 = self.client.get("/integrations/withings/callback?code=up")
+        self.assertEqual(r502.status_code, 502)
 
     def test_ingestion_package_acyclic_dag_and_zero_dashes(self) -> None:
         app_root = Path(__file__).resolve().parents[1] / "app"
