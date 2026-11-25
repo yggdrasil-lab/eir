@@ -20,6 +20,7 @@ jobs:
 
       - name: Run container unit tests
         run: |
-          docker run --rm --entrypoint python -w /work \
-            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/work \
-            -v "$PWD/api:/work:ro" eir-api:ci-test -m tests -v
+          set -euo pipefail
+          tar -C ./api -cf - tests | docker run --rm -i --entrypoint sh -w /app \
+            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/app \
+            eir-api:ci-test -c 'tar -xf - -C /app && exec python -m tests -v'

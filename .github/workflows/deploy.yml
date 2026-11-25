@@ -63,11 +63,12 @@ jobs:
 
       - name: Run Container Unit Tests
         run: |
+          set -euo pipefail
           trap 'docker rmi -f eir-api:ci-test >/dev/null 2>&1 || true' EXIT
           docker build -t eir-api:ci-test ./api
-          docker run --rm --entrypoint python -w /work \
-            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/work \
-            -v "$PWD/api:/work:ro" eir-api:ci-test -m tests -v
+          tar -C ./api -cf - tests | docker run --rm -i --entrypoint sh -w /app \
+            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/app \
+            eir-api:ci-test -c 'tar -xf - -C /app && exec python -m tests -v'
 
       - name: Build and Deploy with Docker Compose
         env:
