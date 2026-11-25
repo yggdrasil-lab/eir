@@ -10,7 +10,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from app.daily_biometrics._types import RollupBatch
+    from app.daily_biometrics import RollupBatch
     from app.schemas import DetectedWorkoutRead
 
 Clock = Callable[[], datetime]

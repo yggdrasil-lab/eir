@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 import re
 from typing import Any
 
-from app.daily_biometrics._registry import METRIC_REGISTRY
+from app.daily_biometrics import METRIC_REGISTRY
 from app.ingestion._types import IngestionError, NormalizedSample
 
 _DATETIME_FORMATS: tuple[str, ...] = (

@@ -61,6 +61,14 @@ jobs:
         run: |
           docker run --rm -v "${EIR_DB_MOUNT_PATH}":/data alpine mkdir -p /data
 
+      - name: Run Container Unit Tests
+        run: |
+          trap 'docker rmi -f eir-api:ci-test >/dev/null 2>&1 || true' EXIT
+          docker build -t eir-api:ci-test ./api
+          docker run --rm --entrypoint python -w /work \
+            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/work \
+            -v "$PWD/api:/work:ro" eir-api:ci-test -m tests -v
+
       - name: Build and Deploy with Docker Compose
         env:
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}

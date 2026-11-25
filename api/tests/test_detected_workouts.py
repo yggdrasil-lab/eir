@@ -5,42 +5,11 @@ from decimal import Decimal
 import unittest
 import uuid
 
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
-from app.db import Base, get_db
-from app.main import app
 from app.models import HealthSample
+from tests._harness import EirTestCase
 
 
-class TestDetectedWorkouts(unittest.TestCase):
-    def setUp(self):
-        self.engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        Base.metadata.create_all(bind=self.engine)
-        self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
-        self.db = self.SessionLocal()
-
-        def override_get_db():
-            session = self.SessionLocal()
-            try:
-                yield session
-            finally:
-                session.close()
-
-        app.dependency_overrides[get_db] = override_get_db
-        self.client = TestClient(app)
-
-    def tearDown(self):
-        self.db.close()
-        Base.metadata.drop_all(bind=self.engine)
-        app.dependency_overrides.clear()
-
+class TestDetectedWorkouts(EirTestCase):
     def test_detected_workouts_empty(self):
         today_str = dt.date.today().isoformat()
         res = self.client.get(f"/biometrics/detected-workouts?target_date={today_str}")
@@ -160,7 +129,7 @@ class TestDetectedWorkouts(unittest.TestCase):
                     ended_at=end_time,
                     value=Decimal("350"),
                     unit="count",
-                    extra={"device": "Raymund's Apple Watch"},
+                    extra={"device": "Alex's Apple Watch"},
                 )
             )
             # iPhone steps overlapping in the same 5-minute interval: 400 steps per 5 min (2,400 total)
@@ -173,7 +142,7 @@ class TestDetectedWorkouts(unittest.TestCase):
                     ended_at=end_time - dt.timedelta(seconds=2),
                     value=Decimal("400"),
                     unit="count",
-                    extra={"device": "Raymund's iPhone"},
+                    extra={"device": "Alex's iPhone"},
                 )
             )
 
@@ -231,7 +200,7 @@ class TestDetectedWorkouts(unittest.TestCase):
                     ended_at=end_time,
                     value=Decimal("320"),
                     unit="count",
-                    extra={"device": "Raymund's Apple Watch"},
+                    extra={"device": "Alex's Apple Watch"},
                 )
             )
 
@@ -292,7 +261,7 @@ class TestDetectedWorkouts(unittest.TestCase):
                     ended_at=end_time,
                     value=Decimal("40"),
                     unit="count",
-                    extra={"device": "Raymund's Apple Watch"},
+                    extra={"device": "Alex's Apple Watch"},
                 )
             )
 
@@ -353,7 +322,7 @@ class TestDetectedWorkouts(unittest.TestCase):
                     ended_at=end_time,
                     value=steps,
                     unit="count",
-                    extra={"device": "Raymund's Apple Watch"},
+                    extra={"device": "Alex's Apple Watch"},
                 )
             )
 
@@ -586,7 +555,7 @@ class TestDetectedWorkouts(unittest.TestCase):
                         ended_at=t + dt.timedelta(minutes=5),
                         value=steps,
                         unit="count",
-                        extra={"device": "Raymund's Apple Watch"},
+                        extra={"device": "Alex's Apple Watch"},
                     )
                 )
 
@@ -977,7 +946,7 @@ class TestDetectedWorkouts(unittest.TestCase):
                     ended_at=e_dt,
                     value=Decimal(str(val)),
                     unit="count",
-                    extra={"device": "Raymund's Apple Watch"},
+                    extra={"device": "Alex's Apple Watch"},
                 )
             )
         for s_dt, e_dt, val in phone_steps:
@@ -990,7 +959,7 @@ class TestDetectedWorkouts(unittest.TestCase):
                     ended_at=e_dt,
                     value=Decimal(str(val)),
                     unit="count",
-                    extra={"device": "Raymund's iPhone"},
+                    extra={"device": "Alex's iPhone"},
                 )
             )
         self.db.commit()
@@ -1065,7 +1034,7 @@ class TestDetectedWorkouts(unittest.TestCase):
                     ended_at=t + dt.timedelta(minutes=5),
                     value=Decimal(str(steps_val)),
                     unit="count",
-                    extra={"device": "Raymund's Apple Watch"},
+                    extra={"device": "Alex's Apple Watch"},
                 )
             )
         self.db.commit()
@@ -1124,7 +1093,7 @@ class TestDetectedWorkouts(unittest.TestCase):
                     ended_at=t + dt.timedelta(minutes=5),
                     value=Decimal("370"),
                     unit="count",
-                    extra={"device": "Raymund's Apple Watch"},
+                    extra={"device": "Alex's Apple Watch"},
                 )
             )
         self.db.commit()

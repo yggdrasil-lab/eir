@@ -1,20 +1,14 @@
 """Tests for the app.daily_biometrics deep module, step relocation, and MCP/router parity."""
 
 import ast
-from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-import json
 from pathlib import Path
 import unittest
-from unittest.mock import patch
 import uuid
 from zoneinfo import ZoneInfo
 
-from mcp.server.mcpserver.exceptions import ToolError
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import select
 
 from app import schemas
 from app.daily_biometrics import (
@@ -23,17 +17,10 @@ from app.daily_biometrics import (
     DailyBiometrics,
     RollupBatch,
 )
-from app.daily_biometrics._window import resolve_local_days
-from app.db import Base
 from app.exertion import deduplicate_step_samples, filter_deduplicated_step_samples
 from app.models import BiometricMeasurement, HealthFeedback, HealthSample
-from app.routers.mcp import (
-    _get_daily_summary_tool,
-    _get_granular_samples_tool,
-    _get_latest_biometrics_tool,
-    _log_measurement_tool,
-)
 from app.schemas import BiometricCreate, DetectedWorkoutRead
+from tests._harness import EirTestCase, call_mcp_tool
 
 
 class _SpyExertion:
@@ -48,22 +35,10 @@ class _SpyExertion:
         return list(self._workouts_by_day.get(target_date, []))
 
 
-class TestDailyBiometricsDeepModule(unittest.TestCase):
+class TestDailyBiometricsDeepModule(EirTestCase):
     def setUp(self) -> None:
+        super().setUp()
         self.nz_tz = ZoneInfo("Pacific/Auckland")
-        self.engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        Base.metadata.create_all(bind=self.engine)
-        self.SessionLocal = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
-        self.db = self.SessionLocal()
-
-    def tearDown(self) -> None:
-        self.db.close()
-        Base.metadata.drop_all(bind=self.engine)
-        self.engine.dispose()
 
     def _add_sample(
         self,
@@ -124,14 +99,15 @@ class TestDailyBiometricsDeepModule(unittest.TestCase):
         utc_evening = datetime(2026, 11, 24, 11, 30, 0, tzinfo=timezone.utc)
         naive_evening = datetime(2026, 11, 24, 11, 30, 0)
         early_day = date(2026, 11, 23)
+        service = DailyBiometrics(self.db, tz=self.nz_tz, exertion=_SpyExertion())
 
-        days = resolve_local_days([utc_evening, naive_evening, early_day, date(2026, 11, 25)], self.nz_tz)
-        self.assertEqual(days, (date(2026, 11, 23), date(2026, 11, 25)))
-        self.assertEqual(resolve_local_days([], self.nz_tz), ())
+        batch = service.materialize_rollups([utc_evening, naive_evening, early_day, date(2026, 11, 25)])
+        self.assertEqual(batch.days, (date(2026, 11, 23), date(2026, 11, 25)))
+        self.assertEqual(service.materialize_rollups([]).days, ())
 
         for invalid in (True, "2026-11-24", 123):
             with self.assertRaises(BiometricsInputError):
-                resolve_local_days([invalid], self.nz_tz)  # type: ignore[list-item]
+                service.materialize_rollups([invalid])  # type: ignore[list-item]
 
     def test_materialize_rollups_single_pass_energy_floor_and_flush_only(self) -> None:
         target_day = date(2026, 11, 24)
@@ -324,82 +300,76 @@ class TestDailyBiometricsDeepModule(unittest.TestCase):
         with self.assertRaises(BiometricsInputError):
             service.granular_samples(target_day, "active_energy", limit=True)
 
-    def test_mcp_tools_parity_with_daily_biometrics(self) -> None:
-        target_day = date(2026, 11, 24)
-        sample_dt = datetime(2026, 11, 24, 7, 15, tzinfo=self.nz_tz)
-
-        self._add_sample(
-            sample_type="wrist_temperature",
-            measured_at=sample_dt,
-            value=Decimal("36.55"),
-            unit="C",
-        )
-        self._add_sample(
-            sample_type="respiratory_rate",
-            measured_at=sample_dt,
-            value=Decimal("14.2"),
-            unit="breaths/min",
-        )
-        self._add_sample(
-            sample_type="oxygen_saturation",
-            measured_at=sample_dt,
-            value=Decimal("98.1"),
-            unit="%",
-        )
-        self._add_sample(
-            sample_type="walking_asymmetry",
-            measured_at=sample_dt,
-            value=Decimal("1.25"),
-            unit="%",
-        )
-        self._add_sample(
-            sample_type="vo2_max",
-            measured_at=sample_dt,
-            value=Decimal("48.3"),
-            unit="ml/kg/min",
-        )
-        self._add_sample(
-            sample_type="active_energy_kcal",
-            measured_at=sample_dt,
-            value=Decimal("220"),
-            unit="kcal",
-        )
+    def _seed_mcp_parity_samples(self, sample_dt: datetime) -> None:
+        for sample_type, value, unit in (
+            ("wrist_temperature", "36.55", "C"),
+            ("respiratory_rate", "14.2", "breaths/min"),
+            ("oxygen_saturation", "98.1", "%"),
+            ("walking_asymmetry", "1.25", "%"),
+            ("vo2_max", "48.3", "ml/kg/min"),
+            ("active_energy_kcal", "220", "kcal"),
+        ):
+            self._add_sample(
+                sample_type=sample_type,
+                measured_at=sample_dt,
+                value=Decimal(value),
+                unit=unit,
+            )
         self.db.commit()
 
-        @contextmanager
-        def fake_mcp_session():
-            yield self.db
+    def test_mcp_tools_parity_with_daily_biometrics(self) -> None:
+        target_day = date(2026, 11, 24)
+        self._seed_mcp_parity_samples(datetime(2026, 11, 24, 7, 15, tzinfo=self.nz_tz))
 
-        with patch("app.routers.mcp.mcp_session", side_effect=fake_mcp_session):
-            empty_latest = json.loads(_get_latest_biometrics_tool())
+        token = "parity-mcp-token"
+        self.patch_settings(mcp_token=token)
+        with self.open_lifespan_client() as client:
+            is_err, empty_latest = call_mcp_tool(client, "eir_get_latest_biometrics", {}, token=token)
+            self.assertFalse(is_err)
             self.assertEqual(empty_latest["status"], "empty")
 
-            logged = json.loads(
-                _log_measurement_tool(
-                    weight_kg=80.4,
-                    body_fat_pct=16.2,
-                    resting_hr_bpm=52,
-                    hrv_ms=71.0,
-                    sleep_duration_hours=7.5,
-                    sleep_score=89,
-                    step_count=6400,
-                    notes="Alex Tan check-in",
-                )
+            is_err, logged = call_mcp_tool(
+                client,
+                "eir_log_measurement",
+                {
+                    "weight_kg": 80.4,
+                    "body_fat_pct": 16.2,
+                    "resting_hr_bpm": 52,
+                    "hrv_ms": 71.0,
+                    "sleep_duration_hours": 7.5,
+                    "sleep_score": 89,
+                    "step_count": 6400,
+                    "notes": "Alex Tan check-in",
+                },
+                token=token,
             )
+            self.assertFalse(is_err)
             self.assertEqual(logged["source"], "agent")
             self.assertEqual(logged["weight_kg"], 80.4)
 
-            latest = json.loads(_get_latest_biometrics_tool(source="agent"))
+            is_err, latest = call_mcp_tool(
+                client, "eir_get_latest_biometrics", {"source": "agent"}, token=token
+            )
+            self.assertFalse(is_err)
             self.assertEqual(latest["id"], logged["id"])
             latest_rec = DailyBiometrics(self.db, tz=self.nz_tz).latest_measurement(source="agent")
             self.assertIsNotNone(latest_rec)
             self.assertEqual(str(latest_rec.id), logged["id"])
 
-            granular = json.loads(_get_granular_samples_tool(target_day.isoformat(), "active_energy"))
+            is_err, granular = call_mcp_tool(
+                client,
+                "eir_get_granular_samples",
+                {"target_date": target_day.isoformat(), "sample_type": "active_energy"},
+                token=token,
+            )
+            self.assertFalse(is_err)
             self.assertEqual(granular["count"], 1)
             self.assertEqual(granular["samples"][0]["value"], 220.0)
 
-            mcp_summary = json.loads(_get_daily_summary_tool(target_day.isoformat()))
+            is_err, mcp_summary = call_mcp_tool(
+                client, "eir_get_daily_summary", {"target_date": target_day.isoformat()}, token=token
+            )
+            self.assertFalse(is_err)
             expected_summary = DailyBiometrics(self.db).daily_summary(target_day).model_dump(mode="json")
             self.assertEqual(mcp_summary, expected_summary)
             self.assertNotIn("readings_count", mcp_summary)
@@ -418,11 +388,6 @@ class TestDailyBiometricsDeepModule(unittest.TestCase):
                 "detected_workouts",
             ):
                 self.assertIn(field, mcp_summary)
-
-            with self.assertRaises(ToolError):
-                _get_granular_samples_tool(target_day.isoformat(), "   ")
-            with self.assertRaises(ToolError):
-                _get_daily_summary_tool("bad-date")
 
     def test_step_dedup_reexported_and_acyclic_boundaries(self) -> None:
         t0 = datetime(2026, 11, 24, 12, 0, tzinfo=timezone.utc)

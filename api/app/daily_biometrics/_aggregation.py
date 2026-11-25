@@ -24,7 +24,7 @@ from app.daily_biometrics._queries import (
 from app.daily_biometrics._registry import METRIC_REGISTRY
 from app.daily_biometrics._types import DailyRollupResult, ExertionPort
 from app.daily_biometrics._window import day_bounds
-from app.exertion._steps import deduplicate_step_samples
+from app.exertion import deduplicate_step_samples
 from app.models import BiometricMeasurement, HealthSample
 
 if TYPE_CHECKING:

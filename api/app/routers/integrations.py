@@ -111,17 +111,22 @@ def withings_webhook_verification() -> dict[str, str]:
     return {"status": "ok", "service": "eir-withings"}
 
 
+def get_withings_sync(db: Session = Depends(get_db)) -> WithingsSync:
+    """Dependency provider for WithingsSync bound to the request database session."""
+    return WithingsSync(db)
+
+
 @router.get(
     "/withings/authorize",
     summary="Initiate Withings OAuth2 authorization flow",
 )
 def withings_authorize(
     format: str | None = Query(default=None, description="Set to 'json' to return authorization URL"),
-    db: Session = Depends(get_db),
+    sync: WithingsSync = Depends(get_withings_sync),
 ):
     """Generates Withings OAuth2 authorization URL and redirects the user."""
     try:
-        auth = WithingsSync(db).build_authorize_url()
+        auth = sync.build_authorize_url()
     except WithingsConfigError as exc:
         raise _map_withings_http_error(exc) from exc
     if format == "json":
@@ -136,11 +141,11 @@ def withings_authorize(
 def withings_oauth_callback(
     code: str = Query(..., description="Authorization code from Withings"),
     state: str | None = Query(default=None),
-    db: Session = Depends(get_db),
+    sync: WithingsSync = Depends(get_withings_sync),
 ) -> dict[str, Any]:
     """Exchanges authorization code for access and refresh tokens, saves them, and subscribes."""
     try:
-        result = WithingsSync(db).complete_oauth_callback(code)
+        result = sync.complete_oauth_callback(code)
     except (WithingsConfigError, WithingsProtocolError, WithingsUpstreamError) as exc:
         raise _map_withings_http_error(exc) from exc
     return {
@@ -157,9 +162,9 @@ def withings_oauth_callback(
     response_model=WithingsAuthStatusResponse,
     summary="Check Withings OAuth connection status",
 )
-def withings_status(db: Session = Depends(get_db)) -> WithingsAuthStatusResponse:
+def withings_status(sync: WithingsSync = Depends(get_withings_sync)) -> WithingsAuthStatusResponse:
     """Returns whether Withings is authorized and token expiry info."""
-    res = WithingsSync(db).connection_status()
+    res = sync.connection_status()
     return WithingsAuthStatusResponse(
         status=res.status,
         linked=res.linked,
@@ -176,11 +181,11 @@ def withings_status(db: Session = Depends(get_db)) -> WithingsAuthStatusResponse
 )
 async def withings_webhook_callback(
     request: Request,
-    db: Session = Depends(get_db),
+    sync: WithingsSync = Depends(get_withings_sync),
 ) -> dict[str, Any]:
     """Receives Withings weigh-in notifications, refreshes token if needed, and ingests measures."""
     payload = await _parse_webhook_body(request)
-    result = await run_in_threadpool(WithingsSync(db).handle_webhook, payload)
+    result = await run_in_threadpool(sync.handle_webhook, payload)
     return {
         "status": result.status,
         "received": result.received,
