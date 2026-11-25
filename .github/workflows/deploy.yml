@@ -6,7 +6,11 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   deploy:
+    needs: test
     runs-on: [self-hosted, gaia]
 
     steps:
@@ -60,15 +64,6 @@ jobs:
           EIR_DB_MOUNT_PATH: ${{ vars.EIR_DB_MOUNT_PATH || '/opt/eir/data' }}
         run: |
           docker run --rm -v "${EIR_DB_MOUNT_PATH}":/data alpine mkdir -p /data
-
-      - name: Run Container Unit Tests
-        run: |
-          set -euo pipefail
-          trap 'docker rmi -f eir-api:ci-test >/dev/null 2>&1 || true' EXIT
-          docker build -t eir-api:ci-test ./api
-          tar -C ./api -cf - tests | docker run --rm -i --entrypoint sh -w /app \
-            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/app \
-            eir-api:ci-test -c 'tar -xf - -C /app && exec python -m tests -v'
 
       - name: Build and Deploy with Docker Compose
         env:
