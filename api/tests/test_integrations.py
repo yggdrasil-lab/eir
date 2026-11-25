@@ -3,16 +3,6 @@
 import datetime as dt
 from decimal import Decimal
 
-from app.schemas import _clean_numeric
-
-
-def test_clean_numeric_multiline_and_strings() -> None:
-    assert _clean_numeric("2 kcal\n1.5 kcal\n3.0 kcal") == Decimal("6.5")
-    assert _clean_numeric(["10", "20.5"]) == Decimal("30.5")
-    assert _clean_numeric({"value": "72.5 kg"}) == Decimal("72.5")
-    assert _clean_numeric("invalid") is None
-    assert _clean_numeric(None) is None
-
 
 def test_withings_webhook_verification(client) -> None:
     response = client.get("/integrations/withings/webhook")
@@ -446,4 +436,63 @@ def test_unified_daily_rollup_merges_scale_and_wearables(client, db) -> None:
     assert m.sleep_duration_s == 23400  # 6.5 hours
     assert m.sleep_deep_s == 23400
     assert m.step_count == 1500
+
+
+def test_withings_authorize_missing_redirect_uri_returns_500(client, monkeypatch) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "withings_client_id", "test-client-id-123")
+    monkeypatch.setattr(settings, "withings_redirect_uri", None)
+
+    res = client.get("/integrations/withings/authorize?format=json")
+    assert res.status_code == 500
+    assert "EIR_WITHINGS_REDIRECT_URI" in res.json()["detail"]
+
+
+def test_withings_measurements_repeated_within_window_dedups_and_unifies(client, db) -> None:
+    from app.models import BiometricMeasurement, HealthSample
+    from sqlalchemy import select
+
+    t1 = dt.datetime(2026, 11, 25, 7, 30, 0, tzinfo=dt.timezone.utc)
+    t2 = t1 + dt.timedelta(seconds=30)
+
+    res1 = client.post(
+        "/integrations/withings/measurements",
+        json={
+            "measured_at": t1.isoformat(),
+            "weight_kg": 82.4,
+            "body_fat_pct": 16.5,
+            "notes": "First reading",
+            "extra": {"scale": "body-smart"},
+        },
+    )
+    assert res1.status_code == 201
+
+    res2 = client.post(
+        "/integrations/withings/measurements",
+        json={
+            "measured_at": t2.isoformat(),
+            "weight_kg": 82.1,
+            "body_fat_pct": 16.3,
+            "notes": "Settled reading",
+            "extra": {"firmware": "v2"},
+        },
+    )
+    assert res2.status_code == 201
+    body = res2.json()
+    assert body["source"] == "withings"
+    assert float(body["weight_kg"]) == 82.1
+    assert float(body["body_fat_pct"]) == 16.3
+    assert body["notes"] == "Settled reading"
+    assert body["extra"]["scale"] == "body-smart"
+    assert body["extra"]["firmware"] == "v2"
+
+    weights = db.scalars(select(HealthSample).where(HealthSample.sample_type == "weight")).all()
+    fats = db.scalars(select(HealthSample).where(HealthSample.sample_type == "body_fat_pct")).all()
+    measurements = db.scalars(select(BiometricMeasurement)).all()
+    assert len(weights) == 1
+    assert weights[0].value == Decimal("82.1")
+    assert len(fats) == 1
+    assert fats[0].value == Decimal("16.3")
+    assert len(measurements) == 1
 

@@ -1,46 +1,14 @@
 """Pydantic schemas for Eir API request and response validation."""
 
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
-import re
+from decimal import Decimal
 from typing import Any
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.daily_biometrics._registry import METRIC_REGISTRY
-
-
-def _clean_numeric(v: Any) -> Decimal | None:
-    """Robustly parse numeric values from iOS Shortcuts (handles units, arrays, and multiline)."""
-    if v is None:
-        return None
-    if isinstance(v, (int, float, Decimal)):
-        return Decimal(str(v))
-    if isinstance(v, dict):
-        for k in ("value", "qty", "amount", "total"):
-            if k in v:
-                return _clean_numeric(v[k])
-        return None
-    if isinstance(v, (list, tuple)):
-        # Sum list of numbers if iOS passes multiple samples
-        cleaned = [_clean_numeric(x) for x in v]
-        nums = [x for x in cleaned if x is not None]
-        return sum(nums, Decimal(0)) if nums else None
-    if isinstance(v, str):
-        # Extract digits and decimals, ignoring suffixes like 'kcal', 'min', 'bpm'
-        # If string contains multiple numbers/lines, sum all matches
-        matches = re.findall(r"[-+]?\d*\.?\d+", v.replace(",", ""))
-        if not matches:
-            return None
-        nums = []
-        for m in matches:
-            try:
-                nums.append(Decimal(m))
-            except InvalidOperation:
-                pass
-        return sum(nums, Decimal(0)) if nums else None
-    return None
+from app.ingestion._shortcuts import clean_datetime, clean_numeric
 
 
 class ORMModel(BaseModel):
@@ -66,15 +34,6 @@ class WithingsMeasurementPayload(BaseModel):
     resting_hr_bpm: int | None = None
     notes: str | None = None
     extra: dict = Field(default_factory=dict)
-
-
-class WithingsNotificationPayload(BaseModel):
-    """Webhook callback from Withings notification subscription."""
-
-    userid: str | None = None
-    appli: int | None = None  # 1 = weight, 44 = sleep, 16 = activity
-    startdate: int | None = None
-    enddate: int | None = None
 
 
 class WithingsAuthStatusResponse(BaseModel):
@@ -267,32 +226,6 @@ class DailyBiometricSummary(BaseModel):
 
 
 # ------------------------------------------------------------- Granular Samples
-def _clean_datetime(v: Any) -> Any:
-    """Parses ISO strings, timestamps, and iOS human-formatted date strings."""
-    if v is None or isinstance(v, datetime):
-        return v
-    if isinstance(v, str):
-        cleaned = v.replace("\u202f", " ").replace(" at ", " ").strip()
-        try:
-            return datetime.fromisoformat(cleaned)
-        except ValueError:
-            pass
-        for fmt in (
-            "%d %b %Y %I:%M %p",
-            "%d %b %Y %I:%M:%S %p",
-            "%d %B %Y %I:%M %p",
-            "%b %d, %Y %I:%M %p",
-            "%Y-%m-%d %H:%M:%S",
-            "%d/%m/%Y %H:%M:%S",
-            "%d/%m/%Y %I:%M %p",
-        ):
-            try:
-                return datetime.strptime(cleaned, fmt)
-            except ValueError:
-                pass
-    return v
-
-
 class HealthSampleItem(BaseModel):
     """A single granular time-series sample (e.g. active energy slice)."""
 
@@ -308,12 +241,12 @@ class HealthSampleItem(BaseModel):
     @field_validator("measured_at", "ended_at", mode="before")
     @classmethod
     def parse_datetimes(cls, v: Any) -> Any:
-        return _clean_datetime(v)
+        return clean_datetime(v)
 
     @field_validator("value", mode="before")
     @classmethod
     def parse_value(cls, v: Any) -> Decimal:
-        parsed = _clean_numeric(v)
+        parsed = clean_numeric(v)
         if parsed is None:
             raise ValueError(f"Cannot parse numeric value from {v}")
         return parsed
@@ -336,39 +269,6 @@ DEFAULT_METRIC_UNITS: dict[str, str] = METRIC_REGISTRY.default_units()
 METRIC_ALIASES: dict[str, str] = METRIC_REGISTRY.input_aliases()
 
 
-def _to_list(val: Any) -> list[Any]:
-    """Coerces list, tuple, or newline-delimited string from iOS Shortcuts into a list."""
-    if val is None:
-        return []
-    if isinstance(val, (list, tuple)):
-        return list(val)
-    if isinstance(val, str):
-        lines = [line.strip() for line in val.splitlines() if line.strip()]
-        return lines
-    return [val]
-
-
-def _parse_duration_seconds(v: Any) -> Decimal | None:
-    """Parses duration from seconds, 'MM:SS', or 'HH:MM:SS' string into seconds."""
-    if v is None:
-        return None
-    if isinstance(v, (int, float, Decimal)):
-        return Decimal(str(v))
-    if isinstance(v, str):
-        v = v.strip()
-        if ":" in v:
-            parts = v.split(":")
-            try:
-                if len(parts) == 2:
-                    return Decimal(int(parts[0]) * 60 + int(parts[1]))
-                elif len(parts) == 3:
-                    return Decimal(int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
-            except (ValueError, TypeError):
-                pass
-        return _clean_numeric(v)
-    return None
-
-
 class AppleHealthComprehensiveSyncPayload(BaseModel):
     """Universal payload for high-resolution multi-metric Apple Health synchronization."""
 
@@ -377,167 +277,6 @@ class AppleHealthComprehensiveSyncPayload(BaseModel):
     source: str = "apple_health"
     samples: list[HealthSampleItem] = Field(default_factory=list)
     metrics: dict[str, Any] = Field(default_factory=dict)
-
-    def extract_all_samples(self) -> list[HealthSampleItem]:
-        """Extracts and normalizes samples from explicit items, metric groups, or flat parallel arrays."""
-        items: list[HealthSampleItem] = list(self.samples)
-
-        # 1. Process explicit metrics dictionary: {"heart_rate": {"start_dates": [...], "values": [...]}}
-        for raw_metric_name, data in self.metrics.items():
-            canonical_type = METRIC_ALIASES.get(raw_metric_name, raw_metric_name)
-            default_unit = DEFAULT_METRIC_UNITS.get(canonical_type)
-            if isinstance(data, dict):
-                s_dates = _to_list(data.get("start_dates") or data.get("dates"))
-                e_dates = _to_list(data.get("end_dates"))
-                vals = _to_list(data.get("values") or data.get("durations"))
-                sources = _to_list(data.get("sources") or data.get("devices"))
-                unit = data.get("unit") or default_unit
-                for i, (st, val) in enumerate(zip(s_dates, vals)):
-                    end = e_dates[i] if i < len(e_dates) else st
-                    cleaned_val = _clean_numeric(val)
-                    if cleaned_val is not None:
-                        extra_meta = {}
-                        if i < len(sources) and sources[i]:
-                            extra_meta["device"] = str(sources[i]).strip()
-                        items.append(
-                            HealthSampleItem(
-                                measured_at=st,
-                                ended_at=end,
-                                value=cleaned_val,
-                                sample_type=canonical_type,
-                                unit=unit,
-                                source=self.source,
-                                extra=extra_meta,
-                            )
-                        )
-
-        # 2. Process flat parallel array patterns from extra fields: e.g. "heart_rate_dates" & "heart_rate_values"
-        extra_fields = dict(getattr(self, "__pydantic_extra__", {}) or {})
-        # Unwrap nested dictionaries (e.g. keyless {"": {...}} or {"payload": {...}} from iOS Shortcuts)
-        for ek, ev in list(extra_fields.items()):
-            if isinstance(ev, dict) and any(subk.endswith("_dates") or subk in ("dates", "start_dates") for subk in ev.keys()):
-                extra_fields.update(ev)
-
-        prefixes: set[str] = set()
-        for k in extra_fields.keys():
-            if k.endswith("_dates"):
-                prefix = k[:-6]
-                if prefix.endswith("_start"):
-                    prefix = prefix[:-6]
-                prefixes.add(prefix)
-
-        for prefix in prefixes:
-            s_dates = _to_list(extra_fields.get(f"{prefix}_start_dates") or extra_fields.get(f"{prefix}_dates"))
-            e_dates = _to_list(extra_fields.get(f"{prefix}_end_dates"))
-            durations = _to_list(extra_fields.get(f"{prefix}_durations"))
-            sources = _to_list(
-                extra_fields.get(f"{prefix}_sources")
-                or extra_fields.get(f"{prefix}_devices")
-                or extra_fields.get(f"{prefix}_source_names")
-            )
-            raw_vals = _to_list(
-                extra_fields.get(f"{prefix}_values")
-                or extra_fields.get(prefix)
-            )
-            canonical_type = METRIC_ALIASES.get(prefix, prefix)
-            default_unit = DEFAULT_METRIC_UNITS.get(canonical_type)
-            unit = extra_fields.get(f"{prefix}_unit") or default_unit
-
-            if canonical_type == "sleep":
-                stages = extra_fields.get(f"{prefix}_stages") or (
-                    raw_vals if raw_vals and any(isinstance(x, str) and not re.match(r"^[\d\.:]+$", str(x).strip()) for x in raw_vals) else []
-                )
-                stage_list = _to_list(stages)
-                max_len = max(len(s_dates), len(e_dates), len(durations), len(raw_vals), len(stage_list), len(sources))
-
-                for i in range(max_len):
-                    st = s_dates[i] if i < len(s_dates) else None
-                    if not st:
-                        continue
-                    end = e_dates[i] if i < len(e_dates) else st
-                    dur = durations[i] if i < len(durations) else None
-                    val = raw_vals[i] if i < len(raw_vals) else None
-                    stage = stage_list[i] if i < len(stage_list) else None
-
-                    duration_s: Decimal | None = None
-                    st_dt = _clean_datetime(st)
-                    end_dt = _clean_datetime(end)
-                    if isinstance(st_dt, datetime) and isinstance(end_dt, datetime) and end_dt > st_dt:
-                        duration_s = Decimal(str(round((end_dt - st_dt).total_seconds(), 2)))
-                    elif dur:
-                        duration_s = _parse_duration_seconds(dur)
-                    elif val and (isinstance(val, (int, float, Decimal)) or (isinstance(val, str) and re.match(r"^[\d\.:]+$", val.strip()))):
-                        duration_s = _parse_duration_seconds(val)
-
-                    if duration_s is not None and duration_s > 0:
-                        extra_meta = {}
-                        if stage and isinstance(stage, str) and stage.strip():
-                            extra_meta["stage"] = stage.strip()
-                        if i < len(sources) and sources[i]:
-                            extra_meta["device"] = str(sources[i]).strip()
-                        items.append(
-                            HealthSampleItem(
-                                measured_at=st,
-                                ended_at=end,
-                                value=duration_s,
-                                sample_type="sleep",
-                                unit="s",
-                                source=self.source,
-                                extra=extra_meta,
-                            )
-                        )
-            else:
-                vals = raw_vals or durations
-                if s_dates and vals:
-                    for i, (st, val) in enumerate(zip(s_dates, vals)):
-                        end = e_dates[i] if i < len(e_dates) else st
-                        cleaned_val = _clean_numeric(val)
-                        if cleaned_val is not None:
-                            extra_meta = {}
-                            if i < len(sources) and sources[i]:
-                                extra_meta["device"] = str(sources[i]).strip()
-                            items.append(
-                                HealthSampleItem(
-                                    measured_at=st,
-                                    ended_at=end,
-                                    value=cleaned_val,
-                                    sample_type=canonical_type,
-                                    unit=unit,
-                                    source=self.source,
-                                    extra=extra_meta,
-                                )
-                            )
-
-        # 3. Process root-level metric fields: e.g. {"sample_type": "active_energy", "dates": [...], "values": [...]}
-        root_st = extra_fields.get("sample_type")
-        root_dates = _to_list(extra_fields.get("start_dates") or extra_fields.get("dates"))
-        root_vals = _to_list(extra_fields.get("values") or extra_fields.get("durations"))
-        root_sources = _to_list(extra_fields.get("sources") or extra_fields.get("devices"))
-        if root_st and root_dates and root_vals:
-            canonical_type = METRIC_ALIASES.get(root_st, root_st)
-            default_unit = DEFAULT_METRIC_UNITS.get(canonical_type)
-            unit = extra_fields.get("unit") or default_unit
-            root_e_dates = _to_list(extra_fields.get("end_dates"))
-            for i, (st, val) in enumerate(zip(root_dates, root_vals)):
-                end = root_e_dates[i] if i < len(root_e_dates) else st
-                cleaned_val = _clean_numeric(val)
-                if cleaned_val is not None:
-                    extra_meta = {}
-                    if i < len(root_sources) and root_sources[i]:
-                        extra_meta["device"] = str(root_sources[i]).strip()
-                    items.append(
-                        HealthSampleItem(
-                            measured_at=st,
-                            ended_at=end,
-                            value=cleaned_val,
-                            sample_type=canonical_type,
-                            unit=unit,
-                            source=self.source,
-                            extra=extra_meta,
-                        )
-                    )
-
-        return items
 
 
 class AppleHealthSyncResponse(BaseModel):
