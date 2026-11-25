@@ -30,6 +30,13 @@ class TestEirAPI(EirTestCase):
         self.assertEqual(data["status"], "ok")
         self.assertEqual(data["database"], "ok")
 
+    def test_cross_origin_health_omits_cors_headers(self) -> None:
+        response = self.client.get("/health", headers={"Origin": "https://evil.example"})
+        self.assertEqual(response.status_code, 200)
+        header_keys = {key.lower() for key in response.headers.keys()}
+        self.assertNotIn("access-control-allow-origin", header_keys)
+        self.assertNotIn("access-control-allow-credentials", header_keys)
+
     def test_health_check_degraded_on_database_error(self) -> None:
         def _broken_db():
             yield _FailingSession()

@@ -15,7 +15,6 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://eir:eir@localhost:5432/eir"
     environment: str = "development"
     log_level: str = "INFO"
-    cors_origins: str = "http://localhost:5173"
     mcp_token: str | None = None
     webhook_secret: str | None = None
     timezone: str = "Pacific/Auckland"
@@ -44,10 +43,6 @@ class Settings(BaseSettings):
     @property
     def tz(self) -> zoneinfo.ZoneInfo:
         return zoneinfo.ZoneInfo(self.timezone)
-
-    @property
-    def cors_origin_list(self) -> list[str]:
-        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
 
 settings = Settings()
