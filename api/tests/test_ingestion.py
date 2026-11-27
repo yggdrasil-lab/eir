@@ -301,6 +301,48 @@ class TestScaleDedupAndTelemetryIngestor(EirTestCase):
         all_measurements = list(self.db.scalars(select(BiometricMeasurement)))
         self.assertEqual(len(all_measurements), 1)
 
+    def test_ingestor_pre_midnight_sleep_triggers_both_evening_and_wake_day_rollups(self) -> None:
+        fake_sync = _FakeWorkoutSync()
+        fake_rollups = _FakeRollups(self.db, self.nz_tz)
+        ingestor = TelemetryIngestor(self.db, rollups=fake_rollups, workout_sync=fake_sync)
+
+        sleep_start = datetime(2026, 11, 25, 23, 50, tzinfo=self.nz_tz)
+        sleep_end = datetime(2026, 11, 26, 7, 0, tzinfo=self.nz_tz)
+        res = ingestor.ingest_samples(
+            [
+                NormalizedSample(
+                    sample_type="sleep",
+                    measured_at=sleep_start,
+                    ended_at=sleep_end,
+                    value=Decimal("25800"),
+                    unit="s",
+                    source="apple_health",
+                    extra={"stage": "Core"},
+                )
+            ],
+            sync_workouts=False,
+        )
+        self.assertEqual(res.days_processed, (date(2026, 11, 25), date(2026, 11, 26)))
+        self.assertEqual(fake_rollups.calls[0], [date(2026, 11, 25), date(2026, 11, 26)])
+
+        # Even if only a pre-midnight fragment >= 18:00 arrives, next day is included
+        fake_rollups_frag = _FakeRollups(self.db, self.nz_tz)
+        ingestor_frag = TelemetryIngestor(self.db, rollups=fake_rollups_frag, workout_sync=fake_sync)
+        res_frag = ingestor_frag.ingest_samples(
+            [
+                NormalizedSample(
+                    sample_type="sleep",
+                    measured_at=datetime(2026, 11, 24, 23, 30, tzinfo=self.nz_tz),
+                    ended_at=datetime(2026, 11, 24, 23, 55, tzinfo=self.nz_tz),
+                    value=Decimal("1500"),
+                    unit="s",
+                    source="apple_health",
+                    extra={"stage": "Core"},
+                )
+            ]
+        )
+        self.assertEqual(res_frag.days_processed, (date(2026, 11, 24), date(2026, 11, 25)))
+
 
 class TestWithingsSyncAndHttpAdapter(EirTestCase):
     def setUp(self) -> None:

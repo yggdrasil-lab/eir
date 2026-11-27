@@ -194,3 +194,96 @@ class TestEirAPI(EirTestCase):
         res = self.client.get(f"/biometrics/daily/{today.isoformat()}")
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()["step_count"], 580)
+
+    def test_daily_summary_http_json_contract_with_naps_and_manual_preservation(self) -> None:
+        target_day = dt.date(2026, 11, 27)
+        t_sleep = dt.datetime(2026, 11, 27, 0, 33, tzinfo=settings.tz)
+        for stage, secs, s_m, e_m in (
+            ("Deep", 3024, 0, 50),
+            ("REM", 6264, 50, 155),
+            ("Core", 14616, 155, 398),
+        ):
+            self.db.add(
+                HealthSample(
+                    source="apple_health",
+                    sample_type="sleep",
+                    measured_at=t_sleep + dt.timedelta(minutes=s_m),
+                    ended_at=t_sleep + dt.timedelta(minutes=e_m),
+                    value=Decimal(str(secs)),
+                    unit="s",
+                    extra={"stage": stage},
+                )
+            )
+        nap_start = dt.datetime(2026, 11, 27, 11, 29, 24, tzinfo=settings.tz)
+        nap_end = dt.datetime(2026, 11, 27, 14, 18, 19, tzinfo=settings.tz)
+        self.db.add(
+            HealthSample(
+                source="apple_health",
+                sample_type="sleep",
+                measured_at=nap_start,
+                ended_at=nap_end,
+                value=Decimal("9029"),
+                unit="s",
+                extra={"stage": "Asleep"},
+            )
+        )
+        self.db.add(
+            HealthSample(
+                source="apple_health",
+                sample_type="hrv",
+                measured_at=dt.datetime(2026, 11, 27, 3, 0, tzinfo=settings.tz),
+                ended_at=dt.datetime(2026, 11, 27, 3, 0, tzinfo=settings.tz),
+                value=Decimal("42.22"),
+                unit="ms",
+            )
+        )
+        self.db.add(
+            HealthSample(
+                source="apple_health",
+                sample_type="hrv",
+                measured_at=dt.datetime(2026, 11, 27, 15, 0, tzinfo=settings.tz),
+                ended_at=dt.datetime(2026, 11, 27, 15, 0, tzinfo=settings.tz),
+                value=Decimal("50.02"),
+                unit="ms",
+            )
+        )
+        self.db.commit()
+
+        from app.daily_biometrics import DailyBiometrics
+
+        DailyBiometrics(self.db).materialize_rollups([target_day])
+        self.db.commit()
+
+        res = self.client.get(f"/biometrics/daily/{target_day.isoformat()}")
+        self.assertEqual(res.status_code, 200)
+        payload = res.json()
+        self.assertEqual(payload["hrv_ms"], "50.02")
+        self.assertEqual(payload["overnight_hrv_ms"], "42.22")
+        self.assertEqual(payload["sleep_duration_hours"], 6.64)
+        self.assertEqual(payload["sleep_deep_hours"], 0.84)
+        self.assertEqual(payload["sleep_rem_hours"], 1.74)
+        self.assertEqual(payload["nap_duration_hours"], 2.51)
+        self.assertEqual(payload["nap_count"], 1)
+        self.assertEqual(payload["total_sleep_hours"], 9.15)
+        self.assertEqual(len(payload["naps"]), 1)
+        self.assertEqual(payload["naps"][0]["duration_hours"], 2.51)
+
+        # Manual-only record without HealthSample rows must not be clobbered
+        manual_day = dt.date(2026, 11, 10)
+        self.db.add(
+            BiometricMeasurement(
+                id=uuid.uuid4(),
+                measured_at=dt.datetime(2026, 11, 10, 8, 0, tzinfo=settings.tz),
+                source="manual",
+                sleep_duration_s=27000,
+                hrv_ms=Decimal("64.50"),
+            )
+        )
+        self.db.commit()
+        manual_res = self.client.get(f"/biometrics/daily/{manual_day.isoformat()}").json()
+        self.assertEqual(manual_res["sleep_duration_hours"], 7.5)
+        self.assertEqual(manual_res["total_sleep_hours"], 7.5)
+        self.assertEqual(manual_res["nap_count"], 0)
+        self.assertIsNone(manual_res["nap_duration_hours"])
+        self.assertEqual(manual_res["naps"], [])
+        self.assertIsNone(manual_res["overnight_hrv_ms"])

@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.orm import Session
 
-from app.daily_biometrics import DailyBiometrics
+from app.config import settings
+from app.daily_biometrics import DailyBiometrics, resolve_sleep_affected_days
 from app.ingestion._dedup import upsert_health_samples
 from app.ingestion._shortcuts import extract_unexpected_keys, normalize_apple_health_payload
 from app.ingestion._types import IngestResult, NormalizedSample, RollupPort, WorkoutSyncPort
@@ -106,7 +107,8 @@ class TelemetryIngestor:
         metrics_counts, created_count = upsert_health_samples(self._db, samples)
         self._db.commit()
 
-        batch = self._rollups.materialize_rollups([s.measured_at for s in samples])
+        affected_days = resolve_sleep_affected_days(samples, settings.tz)
+        batch = self._rollups.materialize_rollups(affected_days)
         self._db.commit()
 
         detected_workouts = tuple(batch.detected_workouts)

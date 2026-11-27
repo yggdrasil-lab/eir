@@ -426,6 +426,214 @@ class TestDailyBiometricsDeepModule(EirTestCase):
                 self.assertFalse(node.module.startswith("app.models"))
                 self.assertNotEqual(node.module, "sqlalchemy")
 
+    def test_sleep_segmentation_overnight_nap_and_overnight_hrv_contract(self) -> None:
+        target_day = date(2026, 11, 27)
+        # Overnight 00:33-07:27 (Deep 0.84h + REM 1.74h + Core 4.06h = 6.64h asleep, plus Awake)
+        t_sleep = datetime(2026, 11, 27, 0, 33, tzinfo=self.nz_tz)
+        overnight_stages = [
+            ("Deep", 3024, 0, 50),
+            ("REM", 6264, 50, 155),
+            ("Awake", 1056, 155, 173),
+            ("Core", 14616, 173, 414),
+        ]
+        for stage, secs, start_m, end_m in overnight_stages:
+            self._add_sample(
+                sample_type="sleep",
+                measured_at=t_sleep + timedelta(minutes=start_m),
+                ended_at=t_sleep + timedelta(minutes=end_m),
+                value=Decimal(str(secs)),
+                unit="s",
+                extra={"stage": stage, "device": "Test Watch"},
+            )
+
+        # Afternoon nap 11:29:24-14:18:19 (7 Asleep rows = 9029s / 2.51h + 6 Awake rows = 1106s)
+        nap_start = datetime(2026, 11, 27, 11, 29, 24, tzinfo=self.nz_tz)
+        nap_end = datetime(2026, 11, 27, 14, 18, 19, tzinfo=self.nz_tz)
+        nap_chunks = [
+            ("Asleep", 1300, nap_start, nap_start + timedelta(minutes=22)),
+            ("Awake", 180, nap_start + timedelta(minutes=22), nap_start + timedelta(minutes=25)),
+            ("Asleep", 1300, nap_start + timedelta(minutes=25), nap_start + timedelta(minutes=47)),
+            ("Awake", 180, nap_start + timedelta(minutes=47), nap_start + timedelta(minutes=50)),
+            ("Asleep", 1300, nap_start + timedelta(minutes=50), nap_start + timedelta(minutes=72)),
+            ("Awake", 180, nap_start + timedelta(minutes=72), nap_start + timedelta(minutes=75)),
+            ("Asleep", 1300, nap_start + timedelta(minutes=75), nap_start + timedelta(minutes=97)),
+            ("Awake", 180, nap_start + timedelta(minutes=97), nap_start + timedelta(minutes=100)),
+            ("Asleep", 1300, nap_start + timedelta(minutes=100), nap_start + timedelta(minutes=122)),
+            ("Awake", 180, nap_start + timedelta(minutes=122), nap_start + timedelta(minutes=125)),
+            ("Asleep", 1300, nap_start + timedelta(minutes=125), nap_start + timedelta(minutes=147)),
+            ("Awake", 206, nap_start + timedelta(minutes=147), nap_start + timedelta(minutes=150)),
+            ("Asleep", 1229, nap_start + timedelta(minutes=150), nap_end),
+        ]
+        for stage, secs, s_dt, e_dt in nap_chunks:
+            self._add_sample(
+                sample_type="sleep",
+                measured_at=s_dt,
+                ended_at=e_dt,
+                value=Decimal(str(secs)),
+                unit="s",
+                extra={"stage": stage, "device": "Test Watch"},
+            )
+
+        # 8 HRV samples: 6 overnight (mean = 42.22), 2 daytime (latest = 50.02)
+        hrv_points = [
+            (datetime(2026, 11, 27, 0, 25, tzinfo=self.nz_tz), "40.00"),
+            (datetime(2026, 11, 27, 1, 30, tzinfo=self.nz_tz), "41.00"),
+            (datetime(2026, 11, 27, 3, 0, tzinfo=self.nz_tz), "42.00"),
+            (datetime(2026, 11, 27, 4, 30, tzinfo=self.nz_tz), "43.00"),
+            (datetime(2026, 11, 27, 6, 0, tzinfo=self.nz_tz), "44.00"),
+            (datetime(2026, 11, 27, 7, 35, tzinfo=self.nz_tz), "43.32"),
+            (datetime(2026, 11, 27, 10, 30, tzinfo=self.nz_tz), "48.00"),
+            (datetime(2026, 11, 27, 15, 0, tzinfo=self.nz_tz), "50.02"),
+        ]
+        for ts, val in hrv_points:
+            self._add_sample(sample_type="hrv", measured_at=ts, value=Decimal(val), unit="ms")
+        self.db.commit()
+
+        service = DailyBiometrics(self.db, tz=self.nz_tz, exertion=_SpyExertion())
+        service.materialize_rollups([target_day])
+        self.db.commit()
+
+        summary = service.daily_summary(target_day)
+        self.assertEqual(summary.hrv_ms, Decimal("50.02"))
+        self.assertEqual(summary.overnight_hrv_ms, Decimal("42.22"))
+        self.assertEqual(summary.sleep_duration_hours, 6.64)
+        self.assertEqual(summary.sleep_deep_hours, 0.84)
+        self.assertEqual(summary.sleep_rem_hours, 1.74)
+        self.assertEqual(summary.nap_duration_hours, 2.51)
+        self.assertEqual(summary.nap_count, 1)
+        self.assertEqual(summary.total_sleep_hours, 9.15)
+        self.assertEqual(len(summary.naps), 1)
+        self.assertEqual(summary.naps[0].start_at, nap_start)
+        self.assertEqual(summary.naps[0].end_at, nap_end)
+        self.assertEqual(summary.naps[0].duration_hours, 2.51)
+
+    def test_late_afternoon_nap_only_and_pre_midnight_recompute_clears_prior_day(self) -> None:
+        nap_day = date(2026, 11, 13)
+        self._add_sample(
+            sample_type="sleep",
+            measured_at=datetime(2026, 11, 13, 16, 29, tzinfo=self.nz_tz),
+            ended_at=datetime(2026, 11, 13, 18, 39, tzinfo=self.nz_tz),
+            value=Decimal("7848"),
+            unit="s",
+            extra={"stage": "Asleep"},
+        )
+        # Pre-midnight sleep 23:50 -> 07:00 must attribute strictly to 2026-11-26
+        prior_day = date(2026, 11, 25)
+        wake_day = date(2026, 11, 26)
+        self._add_sample(
+            sample_type="sleep",
+            measured_at=datetime(2026, 11, 25, 23, 50, tzinfo=self.nz_tz),
+            ended_at=datetime(2026, 11, 26, 7, 0, tzinfo=self.nz_tz),
+            value=Decimal("25800"),
+            unit="s",
+            extra={"stage": "Core"},
+        )
+        # Seed stale legacy rollup on prior_day that must be cleared on recompute
+        self.db.add(
+            BiometricMeasurement(
+                id=uuid.uuid4(),
+                measured_at=datetime(2026, 11, 25, 8, 0, tzinfo=self.nz_tz),
+                source="daily_rollup",
+                sleep_duration_s=25800,
+                sleep_deep_s=1800,
+                sleep_rem_s=1200,
+                extra={
+                    "nap_duration_s": 3600,
+                    "nap_count": 1,
+                    "naps": [{"start_at": "2026-11-25T14:00:00+13:00", "end_at": "2026-11-25T15:00:00+13:00", "duration_s": 3600}],
+                    "overnight_hrv_ms": 55.0,
+                },
+            )
+        )
+        self.db.commit()
+
+        service = DailyBiometrics(self.db, tz=self.nz_tz, exertion=_SpyExertion())
+        service.materialize_rollups([nap_day, date(2026, 11, 14), prior_day, wake_day])
+        self.db.commit()
+
+        nap_summary = service.daily_summary(nap_day)
+        self.assertIsNone(nap_summary.sleep_duration_hours)
+        self.assertEqual(nap_summary.nap_duration_hours, 2.18)
+        self.assertEqual(nap_summary.nap_count, 1)
+        self.assertEqual(nap_summary.total_sleep_hours, 2.18)
+        self.assertIsNone(nap_summary.overnight_hrv_ms)
+        self.assertIsNone(service.daily_summary(date(2026, 11, 14)).total_sleep_hours)
+
+        prior_summary = service.daily_summary(prior_day)
+        self.assertIsNone(prior_summary.sleep_duration_hours)
+        self.assertIsNone(prior_summary.sleep_deep_hours)
+        self.assertIsNone(prior_summary.sleep_rem_hours)
+        self.assertIsNone(prior_summary.nap_duration_hours)
+        self.assertEqual(prior_summary.nap_count, 0)
+        self.assertEqual(prior_summary.naps, [])
+        self.assertIsNone(prior_summary.overnight_hrv_ms)
+
+        wake_summary = service.daily_summary(wake_day)
+        self.assertEqual(wake_summary.sleep_duration_hours, 7.17)
+        self.assertEqual(wake_summary.nap_count, 0)
+        self.assertEqual(wake_summary.total_sleep_hours, 7.17)
+
+    def test_episode_gap_continuity_microsleep_drop_and_legacy_fallback(self) -> None:
+        target_day = date(2026, 11, 22)
+        # Overnight 01:00-06:00 with a 55m awake gap (03:00-03:55) -> merges into one overnight episode
+        self._add_sample(
+            sample_type="sleep",
+            measured_at=datetime(2026, 11, 22, 1, 0, tzinfo=self.nz_tz),
+            ended_at=datetime(2026, 11, 22, 3, 0, tzinfo=self.nz_tz),
+            value=Decimal("7200"),
+            extra={"stage": "Core"},
+        )
+        self._add_sample(
+            sample_type="sleep",
+            measured_at=datetime(2026, 11, 22, 3, 55, tzinfo=self.nz_tz),
+            ended_at=datetime(2026, 11, 22, 6, 0, tzinfo=self.nz_tz),
+            value=Decimal("7500"),
+            extra={"stage": "REM"},
+        )
+        # Micro-sleep noise (10m < 15m) at 13:00 -> ignored
+        self._add_sample(
+            sample_type="sleep",
+            measured_at=datetime(2026, 11, 22, 13, 0, tzinfo=self.nz_tz),
+            ended_at=datetime(2026, 11, 22, 13, 10, tzinfo=self.nz_tz),
+            value=Decimal("600"),
+            extra={"stage": "Asleep"},
+        )
+        # Real nap separated by >60m gap at 15:00-16:00 (3600s = 1.0h)
+        self._add_sample(
+            sample_type="sleep",
+            measured_at=datetime(2026, 11, 22, 15, 0, tzinfo=self.nz_tz),
+            ended_at=datetime(2026, 11, 22, 16, 0, tzinfo=self.nz_tz),
+            value=Decimal("3600"),
+            extra={"stage": "Asleep"},
+        )
+        # Morning HRV fallback (no HRV during 00:45-06:15, but one at 08:30 inside 00:00-10:00)
+        self._add_sample(
+            sample_type="hrv",
+            measured_at=datetime(2026, 11, 22, 8, 30, tzinfo=self.nz_tz),
+            value=Decimal("46.50"),
+            unit="ms",
+        )
+        # Legacy pre-backfill rollup row lacking "sleep_segmented_v1" in extra
+        self.db.add(
+            BiometricMeasurement(
+                id=uuid.uuid4(),
+                measured_at=datetime(2026, 11, 22, 8, 0, tzinfo=self.nz_tz),
+                source="daily_rollup",
+                sleep_duration_s=18900,
+                extra={"vo2_max": 48.1},
+            )
+        )
+        self.db.commit()
+
+        summary = DailyBiometrics(self.db, tz=self.nz_tz, exertion=_SpyExertion()).daily_summary(target_day)
+        self.assertEqual(summary.sleep_duration_hours, 4.08)
+        self.assertEqual(summary.sleep_rem_hours, 2.08)
+        self.assertEqual(summary.nap_duration_hours, 1.0)
+        self.assertEqual(summary.nap_count, 1)
+        self.assertEqual(summary.total_sleep_hours, 5.08)
+        self.assertEqual(summary.overnight_hrv_ms, Decimal("46.50"))
+        self.assertEqual(summary.vo2_max, 48.1)
+
 
 if __name__ == "__main__":
     unittest.main()
