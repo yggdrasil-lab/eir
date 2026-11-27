@@ -164,6 +164,33 @@ def _populate_rollup_vitals(
     return segmented, overnight_hrv
 
 
+def _write_sleep_rollup_extras(
+    cur_extra: dict,
+    segmented: SegmentedSleepResult,
+    overnight_hrv: Decimal | None,
+) -> None:
+    cur_extra["sleep_segmented_v1"] = True
+    if segmented.naps:
+        cur_extra["nap_duration_s"] = segmented.nap_duration_s
+        cur_extra["nap_count"] = segmented.nap_count
+        cur_extra["naps"] = [
+            {
+                "start_at": ep.start_at.isoformat(),
+                "end_at": ep.end_at.isoformat(),
+                "duration_s": ep.sleep_s,
+            }
+            for ep in segmented.naps
+        ]
+    else:
+        for key in ("nap_duration_s", "nap_count", "naps"):
+            cur_extra.pop(key, None)
+
+    if overnight_hrv is not None:
+        cur_extra["overnight_hrv_ms"] = float(overnight_hrv)
+    else:
+        cur_extra.pop("overnight_hrv_ms", None)
+
+
 def _populate_rollup_extras(
     db: Session,
     measurement: BiometricMeasurement,
@@ -182,28 +209,7 @@ def _populate_rollup_extras(
     if vo2max is not None:
         cur_extra["vo2_max"] = round(float(vo2max), 1)
 
-    cur_extra["sleep_segmented_v1"] = True
-    if segmented.naps:
-        cur_extra["nap_duration_s"] = segmented.nap_duration_s
-        cur_extra["nap_count"] = segmented.nap_count
-        cur_extra["naps"] = [
-            {
-                "start_at": ep.start_at.isoformat(),
-                "end_at": ep.end_at.isoformat(),
-                "duration_s": ep.sleep_s,
-            }
-            for ep in segmented.naps
-        ]
-    else:
-        cur_extra.pop("nap_duration_s", None)
-        cur_extra.pop("nap_count", None)
-        cur_extra.pop("naps", None)
-
-    if overnight_hrv is not None:
-        cur_extra["overnight_hrv_ms"] = float(overnight_hrv)
-    else:
-        cur_extra.pop("overnight_hrv_ms", None)
-
+    _write_sleep_rollup_extras(cur_extra, segmented, overnight_hrv)
     measurement.extra = dict(cur_extra)
 
 
