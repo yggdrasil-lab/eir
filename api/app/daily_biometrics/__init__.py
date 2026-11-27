@@ -9,6 +9,7 @@ from app.daily_biometrics._types import (
     ExertionPort,
     RollupBatch,
 )
+from app.daily_biometrics._window import resolve_sleep_affected_days
 
 if TYPE_CHECKING:
     from app.daily_biometrics._facade import DailyBiometrics
@@ -21,6 +22,7 @@ __all__ = [
     "METRIC_REGISTRY",
     "MetricAliasRegistry",
     "RollupBatch",
+    "resolve_sleep_affected_days",
 ]
 
 

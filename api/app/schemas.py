@@ -199,6 +199,14 @@ class WorkoutTimelineRead(BaseModel):
     suggested_splits: list[SuggestedSplitRead] = Field(default_factory=list)
 
 
+class SleepNapRead(BaseModel):
+    """A distinct daytime nap episode segmented from granular sleep telemetry."""
+
+    start_at: datetime
+    end_at: datetime
+    duration_hours: float
+
+
 class DailyBiometricSummary(BaseModel):
     """Daily aggregated vitals rollup for morning briefings and retrospectives."""
 
@@ -207,9 +215,14 @@ class DailyBiometricSummary(BaseModel):
     latest_body_fat_pct: Decimal | None = None
     resting_hr_bpm: int | None = None
     hrv_ms: Decimal | None = None
+    overnight_hrv_ms: Decimal | None = None
     sleep_duration_hours: float | None = None
     sleep_deep_hours: float | None = None
     sleep_rem_hours: float | None = None
+    nap_duration_hours: float | None = None
+    nap_count: int = 0
+    total_sleep_hours: float | None = None
+    naps: list[SleepNapRead] = Field(default_factory=list)
     sleep_score: int | None = None
     wrist_temperature_c: float | None = None
     respiratory_rate_bpm: float | None = None

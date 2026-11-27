@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
+from app.config import settings
 from app.ingestion import (
     InMemoryWithingsCloudAdapter,
     WithingsMeasure,
@@ -553,3 +554,65 @@ class TestIntegrationsRouter(EirTestCase):
         self.assertEqual(len(fats), 1)
         self.assertEqual(fats[0].value, Decimal("16.3"))
         self.assertEqual(len(measurements), 1)
+
+    def test_rollups_recompute_endpoint_auth_validation_and_idempotency(self) -> None:
+        self.patch_settings(webhook_secret="recompute-secret-1")
+        unauth = self.client.post("/integrations/rollups/recompute?days=2")
+        self.assertEqual(unauth.status_code, 401)
+
+        bad_bounds = self.client.post(
+            "/integrations/rollups/recompute?days=91",
+            headers={"Authorization": "Bearer recompute-secret-1"},
+        )
+        self.assertEqual(bad_bounds.status_code, 422)
+
+        today = dt.datetime.now(settings.tz).date()
+        yesterday = today - dt.timedelta(days=1)
+        self.db.add(
+            HealthSample(
+                source="apple_health",
+                sample_type="sleep",
+                measured_at=dt.datetime.combine(yesterday, dt.time(23, 50)).replace(tzinfo=settings.tz),
+                ended_at=dt.datetime.combine(today, dt.time(7, 0)).replace(tzinfo=settings.tz),
+                value=Decimal("25800"),
+                unit="s",
+                extra={"stage": "Core"},
+            )
+        )
+        self.db.add(
+            HealthSample(
+                source="apple_health",
+                sample_type="sleep",
+                measured_at=dt.datetime.combine(today, dt.time(13, 0)).replace(tzinfo=settings.tz),
+                ended_at=dt.datetime.combine(today, dt.time(14, 30)).replace(tzinfo=settings.tz),
+                value=Decimal("5400"),
+                unit="s",
+                extra={"stage": "Asleep"},
+            )
+        )
+        self.db.commit()
+
+        r1 = self.client.post(
+            "/integrations/rollups/recompute?days=2",
+            headers={"X-Webhook-Secret": "recompute-secret-1"},
+        )
+        self.assertEqual(r1.status_code, 200)
+        body1 = r1.json()
+        self.assertEqual(body1["status"], "ok")
+        self.assertEqual(body1["days_processed"], [yesterday.isoformat(), today.isoformat()])
+
+        r2 = self.client.post(
+            "/integrations/rollups/recompute?days=2",
+            headers={"Authorization": "Bearer recompute-secret-1"},
+        )
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.json(), body1)
+
+        today_summary = self.client.get(f"/biometrics/daily/{today.isoformat()}").json()
+        yest_summary = self.client.get(f"/biometrics/daily/{yesterday.isoformat()}").json()
+        self.assertEqual(today_summary["sleep_duration_hours"], 7.17)
+        self.assertEqual(today_summary["nap_duration_hours"], 1.5)
+        self.assertEqual(today_summary["nap_count"], 1)
+        self.assertEqual(today_summary["total_sleep_hours"], 8.67)
+        self.assertIsNone(yest_summary["sleep_duration_hours"])
+        self.assertEqual(yest_summary["nap_count"], 0)

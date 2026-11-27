@@ -1,5 +1,6 @@
 """Thin HTTP router for Withings scale and Apple Health telemetry integrations."""
 
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -8,6 +9,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.daily_biometrics import DailyBiometrics
 from app.db import get_db
 from app.ingestion import (
     IngestionError,
@@ -207,3 +209,23 @@ def ingest_withings_measurement(
 ) -> BiometricMeasurement:
     """Ingests body scale metrics through HealthSample dedup and unified daily rollup."""
     return TelemetryIngestor(db).ingest_direct_scale(payload)
+
+
+@router.post(
+    "/rollups/recompute",
+    summary="Recompute materialized daily biometric rollups over the trailing N days",
+)
+def recompute_daily_rollups(
+    days: int = Query(default=30, ge=1, le=90),
+    db: Session = Depends(get_db),
+    _: None = Depends(verify_webhook_token),
+) -> dict[str, Any]:
+    """Recomputes daily biometric rollups for [today - (days - 1) .. today] in settings.tz."""
+    today = datetime.now(settings.tz).date()
+    target_days = [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
+    batch = DailyBiometrics(db).materialize_rollups(target_days)
+    db.commit()
+    return {
+        "status": "ok",
+        "days_processed": [day.isoformat() for day in batch.days],
+    }
